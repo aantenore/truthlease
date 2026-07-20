@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "truthlease"
+version = "0.1.0a1"
+description = "A deterministic coherence control plane that stops agents from using artifacts after their declared dependencies change."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+  { name = "Antonio Antenore", email = "ant_ant95@hotmail.it" },
+]
+keywords = [
+  "agents",
+  "ai",
+  "coherence",
+  "freshness",
+  "invalidation",
+  "lineage",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "check-wheel-contents>=0.6,<0.7",
+  "hypothesis>=6.130",
+  "jsonschema>=4.23",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+  "twine>=6.2,<7",
+  "types-jsonschema>=4.23",
+]
+
+[project.scripts]
+truthlease = "truthlease.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aantenore/truthlease"
+Documentation = "https://github.com/aantenore/truthlease/tree/main/docs"
+Issues = "https://github.com/aantenore/truthlease/issues"
+Source = "https://github.com/aantenore/truthlease"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/truthlease"]
+
+[tool.uv]
+required-version = "==0.11.21"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["truthlease"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [".tmp", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

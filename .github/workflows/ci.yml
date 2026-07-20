@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          enable-cache: true
+          version: "0.11.21"
+
+      - name: Install locked development environment
+        run: uv sync --locked --extra dev
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Test with coverage
+        run: uv run pytest --cov=truthlease --cov-report=term-missing
+
+      - name: Benchmark smoke
+        run: uv run python benchmarks/benchmark_invalidation.py --nodes 120 --partitions 12
+
+      - name: Build distributions
+        run: uv build --no-sources
+
+      - name: Validate distributions
+        run: |
+          uv run twine check dist/*
+          uv run check-wheel-contents dist/*.whl
+
+      - name: Clean-install wheel smoke
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          uv venv .tmp/smoke --python "$PYTHON_VERSION"
+          uv pip install --python .tmp/smoke/bin/python --no-deps dist/*.whl
+          .tmp/smoke/bin/truthlease schema > .tmp/wheel-schema.json
+          .tmp/smoke/bin/truthlease demo --path .tmp/package-demo.db --reset
+
+      - name: Clean-install sdist smoke
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          uv venv .tmp/sdist-smoke --python "$PYTHON_VERSION"
+          uv pip install --python .tmp/sdist-smoke/bin/python --no-deps dist/*.tar.gz
+          .tmp/sdist-smoke/bin/truthlease schema > .tmp/sdist-schema.json
+          .tmp/sdist-smoke/bin/truthlease demo --path .tmp/sdist-demo.db --reset
+
+  windows-smoke:
+    name: Windows package smoke
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          enable-cache: true
+          version: "0.11.21"
+
+      - name: Build package
+        run: uv build --no-sources
+
+      - name: Clean-install wheel smoke
+        shell: pwsh
+        run: |
+          uv venv .tmp/smoke --python "3.13"
+          $python = ".tmp/smoke/Scripts/python.exe"
+          $truthlease = ".tmp/smoke/Scripts/truthlease.exe"
+          $wheel = (Get-ChildItem dist/*.whl).FullName
+          uv pip install --python $python --no-deps $wheel
+          & $truthlease schema > .tmp/wheel-schema.json
+          & $truthlease demo --path .tmp/package-demo.db --reset

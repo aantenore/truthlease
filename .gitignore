@@ -1,0 +1,17 @@
+.coverage
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+htmlcov/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.tmp/
