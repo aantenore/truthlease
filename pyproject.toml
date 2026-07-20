@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "truthlease"
-version = "0.1.0a1"
+version = "0.2.0a1"
 description = "A deterministic coherence control plane that stops agents from using artifacts after their declared dependencies change."
 readme = "README.md"
 requires-python = ">=3.11"

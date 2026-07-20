@@ -69,6 +69,14 @@ class AssuranceInsufficientError(TruthLeaseError):
     code = "ASSURANCE_INSUFFICIENT"
 
 
+class TargetFenceError(TruthLeaseError):
+    code = "TARGET_FENCE_INVALID"
+
+
+class FencedResultError(TruthLeaseError):
+    code = "FENCED_RESULT_INVALID"
+
+
 class GraphLimitError(TruthLeaseError):
     code = "GRAPH_LIMIT_EXCEEDED"
 

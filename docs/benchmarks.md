@@ -25,6 +25,27 @@ remain reusable. Overflow is a separate safety case: every artifact becomes
 `unknown` and every active lease is invalidated, so no minimality or reuse claim
 applies to that run.
 
+## Target-fencing correctness harness
+
+```bash
+uv run python benchmarks/benchmark_fence_correctness.py
+```
+
+This harness uses the real TruthLease SQLite path and a deterministic in-process
+target whose compare-and-set and attempt-deduplication state change together. It
+checks four protocol cases:
+
+- a matching precondition creates a fenced receipt;
+- a target change produces a certain non-commit and no receipt;
+- a commit followed by a lost response remains indeterminate until the same
+  attempt is replayed, then produces one receipt and one target effect;
+- a successful partial-coverage commit is audited but never promoted to fenced
+  assurance.
+
+Its stable metrics are zero false fenced receipts, zero ambiguous promotions,
+and zero duplicate target effects. It is not a network-performance benchmark and
+does not prove that a third-party adapter implements its declared atomicity.
+
 ## Comparative baselines
 
 Future benchmark releases should compare:
@@ -47,6 +68,10 @@ intervals.
 - duplicate gate consumption;
 - lost committed events.
 - incorrect partial-success result after graph-limit overflow.
+- false fenced receipt count;
+- ambiguous result promoted before resolution;
+- duplicate target effect count under same-attempt replay;
+- partial coverage promoted to global assurance.
 
 ## Performance metrics
 

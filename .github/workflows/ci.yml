@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -55,7 +56,9 @@ jobs:
         run: uv run pytest --cov=truthlease --cov-report=term-missing
 
       - name: Benchmark smoke
-        run: uv run python benchmarks/benchmark_invalidation.py --nodes 120 --partitions 12
+        run: |
+          uv run python benchmarks/benchmark_invalidation.py --nodes 120 --partitions 12
+          uv run python benchmarks/benchmark_fence_correctness.py
 
       - name: Build distributions
         run: uv build --no-sources
@@ -72,6 +75,7 @@ jobs:
           uv venv .tmp/smoke --python "$PYTHON_VERSION"
           uv pip install --python .tmp/smoke/bin/python --no-deps dist/*.whl
           .tmp/smoke/bin/truthlease schema > .tmp/wheel-schema.json
+          .tmp/smoke/bin/truthlease schema --version v2 > .tmp/wheel-schema-v2.json
           .tmp/smoke/bin/truthlease demo --path .tmp/package-demo.db --reset
 
       - name: Clean-install sdist smoke
@@ -81,6 +85,7 @@ jobs:
           uv venv .tmp/sdist-smoke --python "$PYTHON_VERSION"
           uv pip install --python .tmp/sdist-smoke/bin/python --no-deps dist/*.tar.gz
           .tmp/sdist-smoke/bin/truthlease schema > .tmp/sdist-schema.json
+          .tmp/sdist-smoke/bin/truthlease schema --version v2 > .tmp/sdist-schema-v2.json
           .tmp/sdist-smoke/bin/truthlease demo --path .tmp/sdist-demo.db --reset
 
   windows-smoke:
@@ -117,4 +122,5 @@ jobs:
           $wheel = (Get-ChildItem dist/*.whl).FullName
           uv pip install --python $python --no-deps $wheel
           & $truthlease schema > .tmp/wheel-schema.json
+          & $truthlease schema --version v2 > .tmp/wheel-schema-v2.json
           & $truthlease demo --path .tmp/package-demo.db --reset

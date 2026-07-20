@@ -2,14 +2,16 @@
 
 ## Scope and trust assumptions
 
-The `0.1` alpha assumes:
+The `0.2` alpha assumes:
 
 - the host, operating system, Python process, and SQLite file owner are trusted;
 - one application or physically separate database owns each trust domain;
-- arbitrary Python adapters are trusted application code;
+- configured Python adapters are trusted application code and their identities
+  are allowlisted by the embedding application;
 - external sources are authoritative only when registered by the embedding
   application;
-- strong remote safety requires target fencing or idempotency outside the core.
+- a target that claims conditional commit and deduplication implements both
+  atomically for the scope declared by its adapter.
 
 TruthLease does not claim secure multi-tenancy inside one SQLite database.
 
@@ -19,6 +21,8 @@ TruthLease does not claim secure multi-tenancy inside one SQLite database.
 - immutable artifact payload and dependency identity;
 - active lease secrecy and single-use state;
 - gate receipt and accepted-lifecycle event history integrity;
+- immutable attempt, precondition, scope, request, and target-result bindings;
+- distinction between confirmed, rejected, and indeterminate remote outcomes;
 - availability of the invalidation and gate path.
 
 ## Threats and controls
@@ -31,6 +35,13 @@ TruthLease does not claim secure multi-tenancy inside one SQLite database.
 | Dependency laundering | Artifact and lease completeness are capped by the minimum across the required transitive closure. | Model weights and implicit reasoning causes are outside scope. |
 | Stolen or substituted lease | High-entropy ID, exact artifact/effect/target/operation binding, expiry, single use. | The embedding application must protect the ID. |
 | Source changes after local gate | Explicit assurance label and residual-race text. | Only target-side fencing closes this race. |
+| Target changes after local prepare | A trusted adapter must atomically enforce the bound precondition; the HTTP profile uses strong `If-Match`. | The adapter assertion cannot prove a dishonest or incorrectly implemented target. |
+| Duplicate effect after a lost response | The attempt ID is stable and the target contract declares deduplicated replay; recovery reuses the same request fingerprint. | If target retention expires before resolution, the outcome remains indeterminate and automatic retry stops. |
+| False global fencing from a narrow token | The scope digest names the exact protected observation snapshots; only full closure coverage can derive `fenced`. | The embedding application must describe which facts the target token actually protects. |
+| Forged success response | The result must bind the attempt, request, closure, effect, precondition, scope, adapter, target, and operation. | A compromised trusted adapter or host can still fabricate evidence. |
+| Conflicting result replay | Indeterminate evidence may resolve under the same attempt. A late transport ambiguity cannot erase a known terminal fact, while different terminal evidence marks the attempt disputed, invalidates its historical receipt, and fails closed. | Operators must investigate the target and adapter before recovery. |
+| Redirect or endpoint substitution | The strict HTTP profile fixes one endpoint and disables redirects. | DNS, TLS, and endpoint credentials remain host responsibilities. |
+| Response-body exhaustion or header injection | Bounded reads, strict media type, and input validation reject malformed evidence and reserved-header overrides. | The application still needs process-level resource limits. |
 | Conflicting source content | Same version with a different digest becomes `disputed`; effects fail closed. | TruthLease cannot decide which external authority is correct. |
 | Graph denial of service | Configurable depth and node limits; overflow marks all artifacts `unknown` and invalidates all active leases in one local transaction. | The global fallback preserves safety but sacrifices availability and reuse; large legitimate graphs require a different store adapter. |
 | SQLite unsafe defaults | Foreign keys, full sync, trusted schema off, rollback journal, integrity doctor. | Filesystem or host failure can still corrupt storage; backups remain required. |
@@ -57,8 +68,11 @@ sequenceDiagram
 ```
 
 Without a target-side `If-Match: 41` or equivalent compare-and-set, TruthLease
-cannot atomically bridge this gap. `observed` and `revalidated` therefore never
-claim the guarantee of `fenced`.
+cannot atomically bridge this gap. The fenced path instead prepares an immutable
+attempt, closes the local transaction, and asks a cooperating target to enforce
+the bound precondition and deduplicate that attempt in its own atomic commit.
+Only the subsequently verified result can produce the historical `fenced`
+receipt. `observed` and `revalidated` never claim that guarantee.
 
 ## Operational controls
 
@@ -77,5 +91,13 @@ claim the guarantee of `fenced`.
 - Do not call network adapters while holding a TruthLease transaction.
 - Never retry a non-idempotent external effect after an ambiguous outcome without
   authoritative verification.
+- Reuse the original attempt and request fingerprint when resolving an ambiguous
+  target call; never mint a fresh key merely because the caller timed out.
+- Keep target deduplication retention longer than the maximum retry and recovery
+  horizon. When retention is unknown or expired, stop automatically.
+- Treat partial scope as partial even when the target commit succeeds. Separate
+  target receipts do not imply atomicity across multiple systems.
+- Do not place raw effect bodies, target tokens, credentials, or response bodies
+  in logs. TruthLease persists their canonical bindings and a receipt reference.
 
 Security issues should follow [SECURITY.md](../SECURITY.md).

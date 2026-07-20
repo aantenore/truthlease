@@ -26,16 +26,22 @@ from truthlease.models import (
     DependencyCompleteness,
     DependencyKind,
     DependencySnapshot,
+    FenceCoverage,
+    FencedAttempt,
+    FencedAttemptStatus,
+    FencedReceipt,
+    FencedResult,
     Lease,
     LeaseStatus,
     Observation,
     ObservationStatus,
     ReconcileAction,
+    ReplayAssurance,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 APPLICATION_ID = 0x54525554  # ASCII "TRUT"
-_EXPECTED_TABLES = {
+_V1_EXPECTED_TABLES = {
     "artifacts",
     "dependencies",
     "event_log",
@@ -45,7 +51,7 @@ _EXPECTED_TABLES = {
     "observations",
     "runtime_state",
 }
-_EXPECTED_COLUMNS = {
+_V1_EXPECTED_COLUMNS = {
     "event_log": {
         "sequence",
         "source",
@@ -129,10 +135,93 @@ _EXPECTED_COLUMNS = {
     },
     "runtime_state": {"singleton", "coherence_fault", "faulted_at"},
 }
-_EXPECTED_INDEXES = {
+_V1_EXPECTED_INDEXES = {
     "dependencies_reverse_artifact",
     "dependencies_reverse_observation",
     "leases_by_artifact",
+}
+_EXPECTED_TABLES = _V1_EXPECTED_TABLES | {
+    "lease_fence_bindings",
+    "fenced_attempts",
+    "fenced_results",
+    "fenced_receipts",
+}
+_EXPECTED_COLUMNS = {
+    **_V1_EXPECTED_COLUMNS,
+    "lease_fence_bindings": {
+        "lease_id",
+        "adapter_id",
+        "mechanism",
+        "precondition_digest",
+        "scope_digest",
+        "coverage",
+        "replay_assurance",
+        "protected_observations_json",
+        "created_at",
+    },
+    "fenced_attempts": {
+        "attempt_id",
+        "lease_id",
+        "gate_receipt_id",
+        "adapter_id",
+        "request_digest",
+        "precondition_digest",
+        "scope_digest",
+        "coverage",
+        "replay_assurance",
+        "status",
+        "prepared_at",
+        "completed_at",
+        "result_digest",
+    },
+    "fenced_results": {
+        "result_id",
+        "attempt_id",
+        "result_digest",
+        "outcome",
+        "adapter_id",
+        "request_digest",
+        "closure_digest",
+        "effect_digest",
+        "target",
+        "operation",
+        "precondition_digest",
+        "scope_digest",
+        "replay_assurance",
+        "coverage",
+        "target_result_digest",
+        "target_receipt_ref",
+        "committed_at",
+        "recorded_at",
+    },
+    "fenced_receipts": {
+        "receipt_id",
+        "attempt_id",
+        "result_id",
+        "lease_id",
+        "gate_receipt_id",
+        "assurance",
+        "adapter_id",
+        "request_digest",
+        "closure_digest",
+        "effect_digest",
+        "target",
+        "operation",
+        "precondition_digest",
+        "scope_digest",
+        "replay_assurance",
+        "coverage",
+        "target_result_digest",
+        "target_receipt_ref",
+        "committed_at",
+        "recorded_at",
+        "guarantee_text",
+    },
+}
+_EXPECTED_INDEXES = _V1_EXPECTED_INDEXES | {
+    "fenced_attempts_by_status",
+    "fenced_results_by_attempt",
+    "fenced_receipts_by_lease",
 }
 
 
@@ -168,15 +257,15 @@ class SQLiteStore:
                 raise RuntimeError(
                     f"database belongs to application_id {application_id}, not TruthLease"
                 )
-            if version not in (0, SCHEMA_VERSION):
+            if version not in (0, 1, SCHEMA_VERSION):
                 raise RuntimeError(
-                    f"unsupported database schema version {version}; expected {SCHEMA_VERSION}"
+                    f"unsupported database schema version {version}; expected 1 or {SCHEMA_VERSION}"
                 )
             if version == 0 and (application_id != 0 or existing_tables):
                 raise RuntimeError("refusing to initialize a non-empty unversioned database")
-            if version == SCHEMA_VERSION and application_id != APPLICATION_ID:
+            if version in (1, SCHEMA_VERSION) and application_id != APPLICATION_ID:
                 raise RuntimeError("versioned database is missing the TruthLease application_id")
-            if version == SCHEMA_VERSION and not _schema_shape_ok(connection):
+            if version in (1, SCHEMA_VERSION) and not _schema_shape_ok(connection, version=version):
                 raise RuntimeError("TruthLease database schema shape is incomplete or unexpected")
             _configure_owned_connection(connection)
             connection.execute("BEGIN IMMEDIATE")
@@ -188,6 +277,9 @@ class SQLiteStore:
                     "INSERT INTO runtime_state(singleton, coherence_fault, faulted_at) "
                     "VALUES (1, NULL, NULL)"
                 )
+            elif version == 1:
+                _execute_schema(connection, _SCHEMA_V2_ADDITIONS)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -219,7 +311,7 @@ class SQLiteStore:
         with self.transaction(write=False) as tx:
             integrity = [row[0] for row in tx.connection.execute("PRAGMA integrity_check")]
             foreign_keys = [dict(row) for row in tx.connection.execute("PRAGMA foreign_key_check")]
-            shape_ok = _schema_shape_ok(tx.connection)
+            shape_ok = _schema_shape_ok(tx.connection, version=SCHEMA_VERSION)
             application_id = int(tx.connection.execute("PRAGMA application_id").fetchone()[0])
             version = int(tx.connection.execute("PRAGMA user_version").fetchone()[0])
             return {
@@ -697,6 +789,209 @@ class SQLiteUnitOfWork:
             ),
         )
 
+    def insert_lease_fence_binding(
+        self,
+        *,
+        lease_id: str,
+        adapter_id: str,
+        mechanism: str,
+        precondition_digest: str,
+        scope_digest: str,
+        coverage: FenceCoverage,
+        replay_assurance: ReplayAssurance,
+        protected_observations: Sequence[str],
+        created_at: str,
+    ) -> None:
+        """Persist a digest-only target binding; raw precondition tokens never enter SQLite."""
+        self.connection.execute(
+            """
+            INSERT INTO lease_fence_bindings(
+                lease_id, adapter_id, mechanism, precondition_digest, scope_digest,
+                coverage, replay_assurance, protected_observations_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lease_id,
+                adapter_id,
+                mechanism,
+                precondition_digest,
+                scope_digest,
+                coverage.value,
+                replay_assurance.value,
+                json.dumps(sorted(protected_observations), separators=(",", ":")),
+                created_at,
+            ),
+        )
+
+    def get_lease_fence_binding(self, lease_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM lease_fence_bindings WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        protected = json.loads(row["protected_observations_json"])
+        if not isinstance(protected, list) or any(not isinstance(item, str) for item in protected):
+            raise RuntimeError("stored fence binding has invalid protected observations")
+        return {
+            "lease_id": row["lease_id"],
+            "adapter_id": row["adapter_id"],
+            "mechanism": row["mechanism"],
+            "precondition_digest": row["precondition_digest"],
+            "scope_digest": row["scope_digest"],
+            "coverage": FenceCoverage(row["coverage"]),
+            "replay_assurance": ReplayAssurance(row["replay_assurance"]),
+            "protected_observations": tuple(protected),
+            "created_at": parse_utc(row["created_at"]),
+        }
+
+    def insert_fenced_attempt(self, attempt: FencedAttempt) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO fenced_attempts(
+                attempt_id, lease_id, gate_receipt_id, adapter_id, request_digest,
+                precondition_digest, scope_digest, coverage, replay_assurance, status,
+                prepared_at, completed_at, result_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt.attempt_id,
+                attempt.lease_id,
+                attempt.gate_receipt_id,
+                attempt.adapter_id,
+                attempt.request_digest,
+                attempt.precondition_digest,
+                attempt.scope_digest,
+                attempt.coverage.value,
+                attempt.replay_assurance.value,
+                attempt.status.value,
+                utc_text(attempt.prepared_at),
+                utc_text(attempt.completed_at) if attempt.completed_at else None,
+                attempt.result_digest,
+            ),
+        )
+
+    def get_fenced_attempt(self, attempt_id: str) -> FencedAttempt | None:
+        row = self.connection.execute(
+            "SELECT * FROM fenced_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        return _fenced_attempt_from_row(row) if row is not None else None
+
+    def get_fenced_attempt_for_lease(self, lease_id: str) -> FencedAttempt | None:
+        row = self.connection.execute(
+            "SELECT * FROM fenced_attempts WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+        return _fenced_attempt_from_row(row) if row is not None else None
+
+    def set_fenced_attempt_result(
+        self,
+        attempt_id: str,
+        *,
+        status: FencedAttemptStatus,
+        completed_at: str | None,
+        result_digest: str,
+    ) -> None:
+        cursor = self.connection.execute(
+            """
+            UPDATE fenced_attempts
+            SET status = ?, completed_at = ?, result_digest = ?
+            WHERE attempt_id = ?
+            """,
+            (status.value, completed_at, result_digest, attempt_id),
+        )
+        if cursor.rowcount != 1:
+            raise NotFoundError("fenced attempt does not exist", details={"attempt_id": attempt_id})
+
+    def insert_fenced_result(
+        self,
+        *,
+        result_id: str,
+        result_digest: str,
+        result: FencedResult,
+        recorded_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO fenced_results(
+                result_id, attempt_id, result_digest, outcome, adapter_id,
+                request_digest, closure_digest, effect_digest, target, operation,
+                precondition_digest, scope_digest, replay_assurance, coverage,
+                target_result_digest, target_receipt_ref, committed_at, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result_id,
+                result.attempt_id,
+                result_digest,
+                result.outcome.value,
+                result.adapter_id,
+                result.request_digest,
+                result.closure_digest,
+                result.effect_digest,
+                result.target,
+                result.operation,
+                result.precondition_digest,
+                result.scope_digest,
+                result.replay_assurance.value,
+                result.coverage.value,
+                result.target_result_digest,
+                result.target_receipt_ref,
+                utc_text(result.committed_at) if result.committed_at else None,
+                recorded_at,
+            ),
+        )
+
+    def get_fenced_result_id(self, attempt_id: str, result_digest: str) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT result_id FROM fenced_results
+            WHERE attempt_id = ? AND result_digest = ?
+            """,
+            (attempt_id, result_digest),
+        ).fetchone()
+        return str(row["result_id"]) if row is not None else None
+
+    def insert_fenced_receipt(self, receipt: FencedReceipt, *, result_id: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO fenced_receipts(
+                receipt_id, attempt_id, result_id, lease_id, gate_receipt_id,
+                assurance, adapter_id, request_digest, closure_digest, effect_digest,
+                target, operation, precondition_digest, scope_digest, replay_assurance,
+                coverage, target_result_digest, target_receipt_ref, committed_at,
+                recorded_at, guarantee_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                receipt.receipt_id,
+                receipt.attempt_id,
+                result_id,
+                receipt.lease_id,
+                receipt.gate_receipt_id,
+                receipt.assurance.value,
+                receipt.adapter_id,
+                receipt.request_digest,
+                receipt.closure_digest,
+                receipt.effect_digest,
+                receipt.target,
+                receipt.operation,
+                receipt.precondition_digest,
+                receipt.scope_digest,
+                receipt.replay_assurance.value,
+                receipt.coverage.value,
+                receipt.target_result_digest,
+                receipt.target_receipt_ref,
+                utc_text(receipt.committed_at),
+                utc_text(receipt.recorded_at),
+                receipt.guarantee,
+            ),
+        )
+
+    def get_fenced_receipt(self, attempt_id: str) -> FencedReceipt | None:
+        row = self.connection.execute(
+            "SELECT * FROM fenced_receipts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        return _fenced_receipt_from_row(row) if row is not None else None
+
     def list_artifacts(self) -> list[Artifact]:
         rows = self.connection.execute(
             "SELECT artifact_id, revision FROM artifacts ORDER BY artifact_id, revision"
@@ -736,16 +1031,26 @@ def _configure_owned_connection(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA synchronous = FULL")
 
 
-def _schema_shape_ok(connection: sqlite3.Connection) -> bool:
+def _schema_shape_ok(connection: sqlite3.Connection, *, version: int) -> bool:
+    if version == 1:
+        expected_tables = _V1_EXPECTED_TABLES
+        expected_columns = _V1_EXPECTED_COLUMNS
+        expected_indexes = _V1_EXPECTED_INDEXES
+    elif version == SCHEMA_VERSION:
+        expected_tables = _EXPECTED_TABLES
+        expected_columns = _EXPECTED_COLUMNS
+        expected_indexes = _EXPECTED_INDEXES
+    else:
+        return False
     tables = {
         str(row[0])
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    if tables != _EXPECTED_TABLES:
+    if tables != expected_tables:
         return False
-    for table, expected in _EXPECTED_COLUMNS.items():
+    for table, expected in expected_columns.items():
         columns = {str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')}
         if columns != expected:
             return False
@@ -755,7 +1060,7 @@ def _schema_shape_ok(connection: sqlite3.Connection) -> bool:
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    return indexes >= _EXPECTED_INDEXES
+    return indexes >= expected_indexes
 
 
 def _observation_from_row(row: sqlite3.Row) -> Observation:
@@ -827,7 +1132,50 @@ def _lease_from_row(row: sqlite3.Row, snapshot_rows: Sequence[sqlite3.Row]) -> L
     )
 
 
-_SCHEMA = """
+def _fenced_attempt_from_row(row: sqlite3.Row) -> FencedAttempt:
+    return FencedAttempt(
+        attempt_id=row["attempt_id"],
+        lease_id=row["lease_id"],
+        gate_receipt_id=row["gate_receipt_id"],
+        adapter_id=row["adapter_id"],
+        request_digest=row["request_digest"],
+        precondition_digest=row["precondition_digest"],
+        scope_digest=row["scope_digest"],
+        replay_assurance=ReplayAssurance(row["replay_assurance"]),
+        coverage=FenceCoverage(row["coverage"]),
+        status=FencedAttemptStatus(row["status"]),
+        prepared_at=parse_utc(row["prepared_at"]),
+        completed_at=parse_utc(row["completed_at"]) if row["completed_at"] else None,
+        result_digest=row["result_digest"],
+    )
+
+
+def _fenced_receipt_from_row(row: sqlite3.Row) -> FencedReceipt:
+    return FencedReceipt(
+        receipt_id=row["receipt_id"],
+        attempt_id=row["attempt_id"],
+        lease_id=row["lease_id"],
+        gate_receipt_id=row["gate_receipt_id"],
+        assurance=AssuranceLevel(row["assurance"]),
+        adapter_id=row["adapter_id"],
+        request_digest=row["request_digest"],
+        closure_digest=row["closure_digest"],
+        effect_digest=row["effect_digest"],
+        target=row["target"],
+        operation=row["operation"],
+        precondition_digest=row["precondition_digest"],
+        scope_digest=row["scope_digest"],
+        replay_assurance=ReplayAssurance(row["replay_assurance"]),
+        coverage=FenceCoverage(row["coverage"]),
+        target_result_digest=row["target_result_digest"],
+        target_receipt_ref=row["target_receipt_ref"],
+        committed_at=parse_utc(row["committed_at"]),
+        recorded_at=parse_utc(row["recorded_at"]),
+        guarantee=row["guarantee_text"],
+    )
+
+
+_SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS event_log (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
@@ -959,9 +1307,109 @@ CREATE TABLE IF NOT EXISTS runtime_state (
 """
 
 
-def _execute_schema(connection: sqlite3.Connection) -> None:
+_SCHEMA_V2_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS lease_fence_bindings (
+    lease_id TEXT PRIMARY KEY,
+    adapter_id TEXT NOT NULL,
+    mechanism TEXT NOT NULL,
+    precondition_digest TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    coverage TEXT NOT NULL CHECK(coverage IN ('full', 'partial')),
+    replay_assurance TEXT NOT NULL
+        CHECK(replay_assurance IN ('deduplicated', 'one_shot', 'unknown')),
+    protected_observations_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(lease_id) REFERENCES leases(lease_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS fenced_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    lease_id TEXT NOT NULL UNIQUE,
+    gate_receipt_id TEXT NOT NULL UNIQUE,
+    adapter_id TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    precondition_digest TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    coverage TEXT NOT NULL CHECK(coverage IN ('full', 'partial')),
+    replay_assurance TEXT NOT NULL
+        CHECK(replay_assurance IN ('deduplicated', 'one_shot', 'unknown')),
+    status TEXT NOT NULL
+        CHECK(status IN ('prepared', 'committed', 'not_committed', 'indeterminate', 'disputed')),
+    prepared_at TEXT NOT NULL,
+    completed_at TEXT,
+    result_digest TEXT,
+    FOREIGN KEY(lease_id) REFERENCES leases(lease_id),
+    FOREIGN KEY(gate_receipt_id) REFERENCES gate_receipts(receipt_id)
+);
+
+CREATE INDEX IF NOT EXISTS fenced_attempts_by_status
+ON fenced_attempts(status, prepared_at);
+
+CREATE TABLE IF NOT EXISTS fenced_results (
+    result_id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL,
+    result_digest TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('committed', 'not_committed', 'indeterminate')),
+    adapter_id TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    closure_digest TEXT NOT NULL,
+    effect_digest TEXT NOT NULL,
+    target TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    precondition_digest TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    replay_assurance TEXT NOT NULL
+        CHECK(replay_assurance IN ('deduplicated', 'one_shot', 'unknown')),
+    coverage TEXT NOT NULL CHECK(coverage IN ('full', 'partial')),
+    target_result_digest TEXT NOT NULL,
+    target_receipt_ref TEXT,
+    committed_at TEXT,
+    recorded_at TEXT NOT NULL,
+    UNIQUE(attempt_id, result_digest),
+    FOREIGN KEY(attempt_id) REFERENCES fenced_attempts(attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS fenced_results_by_attempt
+ON fenced_results(attempt_id, recorded_at);
+
+CREATE TABLE IF NOT EXISTS fenced_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE,
+    result_id TEXT NOT NULL UNIQUE,
+    lease_id TEXT NOT NULL UNIQUE,
+    gate_receipt_id TEXT NOT NULL UNIQUE,
+    assurance TEXT NOT NULL CHECK(assurance = 'fenced'),
+    adapter_id TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    closure_digest TEXT NOT NULL,
+    effect_digest TEXT NOT NULL,
+    target TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    precondition_digest TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    replay_assurance TEXT NOT NULL CHECK(replay_assurance = 'deduplicated'),
+    coverage TEXT NOT NULL CHECK(coverage = 'full'),
+    target_result_digest TEXT NOT NULL,
+    target_receipt_ref TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    guarantee_text TEXT NOT NULL,
+    FOREIGN KEY(attempt_id) REFERENCES fenced_attempts(attempt_id),
+    FOREIGN KEY(result_id) REFERENCES fenced_results(result_id),
+    FOREIGN KEY(lease_id) REFERENCES leases(lease_id),
+    FOREIGN KEY(gate_receipt_id) REFERENCES gate_receipts(receipt_id)
+);
+
+CREATE INDEX IF NOT EXISTS fenced_receipts_by_lease
+ON fenced_receipts(lease_id);
+"""
+
+_SCHEMA = _SCHEMA_V1 + _SCHEMA_V2_ADDITIONS
+
+
+def _execute_schema(connection: sqlite3.Connection, schema: str = _SCHEMA) -> None:
     pending = ""
-    for line in _SCHEMA.splitlines(keepends=True):
+    for line in schema.splitlines(keepends=True):
         pending += line
         if sqlite3.complete_statement(pending):
             connection.execute(pending)

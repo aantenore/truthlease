@@ -114,7 +114,7 @@ def test_database_integrity_contract(tmp_path: Path) -> None:
     assert report["ok"] is True
     assert report["foreign_keys_enabled"] is True
     assert report["journal_mode"] == "delete"
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
 
 
 def test_cli_exposes_and_enforces_observation_generation(

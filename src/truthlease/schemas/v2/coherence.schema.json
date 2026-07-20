@@ -1,0 +1,420 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/aantenore/truthlease/main/schemas/v2/coherence.schema.json",
+  "title": "TruthLease Coherence Contract v2",
+  "oneOf": [
+    { "$ref": "#/$defs/observation" },
+    { "$ref": "#/$defs/artifact" },
+    { "$ref": "#/$defs/lease" },
+    { "$ref": "#/$defs/assuranceEvidence" },
+    { "$ref": "#/$defs/gateDecision" },
+    { "$ref": "#/$defs/targetPrecondition" },
+    { "$ref": "#/$defs/fencedCommitRequest" },
+    { "$ref": "#/$defs/fencedAttempt" },
+    { "$ref": "#/$defs/fencedResult" },
+    { "$ref": "#/$defs/fencedReceipt" }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*:[A-Za-z0-9._~+/=-]+$"
+    },
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "revision"],
+      "properties": {
+        "artifact_id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "dependency_id", "expected_digest", "required"],
+      "properties": {
+        "kind": { "enum": ["observation", "artifact"] },
+        "dependency_id": { "type": "string", "minLength": 1 },
+        "expected_digest": { "$ref": "#/$defs/digest" },
+        "expected_version": { "type": ["string", "null"] },
+        "expected_generation": { "type": ["integer", "null"], "minimum": 1 },
+        "expected_revision": { "type": ["integer", "null"], "minimum": 1 },
+        "required": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "observation" } } },
+          "then": {
+            "required": ["expected_version", "expected_generation"],
+            "properties": {
+              "expected_version": { "type": "string", "minLength": 1 },
+              "expected_generation": { "type": "integer", "minimum": 1 },
+              "expected_revision": { "type": "null" }
+            }
+          },
+          "else": {
+            "required": ["expected_revision"],
+            "properties": {
+              "expected_version": { "type": "null" },
+              "expected_generation": { "type": "null" },
+              "expected_revision": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "version",
+        "digest",
+        "generation",
+        "observed_at",
+        "status",
+        "source"
+      ],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "digest": { "$ref": "#/$defs/digest" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "valid_until": { "type": ["string", "null"], "format": "date-time" },
+        "status": { "enum": ["current", "disputed", "unknown", "revoked"] },
+        "source": { "type": "string", "minLength": 1 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref",
+        "kind",
+        "payload_digest",
+        "dependencies",
+        "completeness",
+        "status",
+        "reconcile_action",
+        "created_at"
+      ],
+      "properties": {
+        "ref": { "$ref": "#/$defs/artifactRef" },
+        "kind": { "type": "string", "minLength": 1 },
+        "payload_digest": { "$ref": "#/$defs/digest" },
+        "payload_ref": { "type": ["string", "null"] },
+        "dependencies": { "type": "array", "items": { "$ref": "#/$defs/dependency" } },
+        "completeness": { "enum": ["unknown", "declared", "observed"] },
+        "status": { "enum": ["fresh", "stale", "disputed", "unknown", "revoked"] },
+        "reconcile_action": { "enum": ["block", "notify", "recompute", "replan", "human"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "invalidated_at": { "type": ["string", "null"], "format": "date-time" },
+        "invalidation_reason": { "type": ["string", "null"] }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "version", "generation", "digest"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "generation": { "type": "integer", "minimum": 1 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lease_id",
+        "artifact",
+        "artifact_digest",
+        "effect_digest",
+        "target",
+        "operation",
+        "required_assurance",
+        "dependency_completeness",
+        "closure_digest",
+        "snapshot",
+        "issued_at",
+        "expires_at",
+        "boot_epoch",
+        "status"
+      ],
+      "properties": {
+        "lease_id": { "type": "string", "minLength": 1 },
+        "artifact": { "$ref": "#/$defs/artifactRef" },
+        "artifact_digest": { "$ref": "#/$defs/digest" },
+        "effect_digest": { "$ref": "#/$defs/digest" },
+        "target": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "required_assurance": { "enum": ["declared", "observed", "revalidated", "fenced"] },
+        "dependency_completeness": { "enum": ["unknown", "declared", "observed"] },
+        "closure_digest": { "$ref": "#/$defs/digest" },
+        "snapshot": { "type": "array", "items": { "$ref": "#/$defs/snapshot" } },
+        "issued_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "boot_epoch": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["active", "consumed", "expired", "invalidated", "revoked"] },
+        "consumed_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "assuranceEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level",
+        "authority",
+        "evidence_digest",
+        "observed_at",
+        "lease_id",
+        "closure_digest",
+        "effect_digest",
+        "target",
+        "operation"
+      ],
+      "properties": {
+        "level": { "const": "revalidated" },
+        "authority": { "type": "string", "minLength": 1 },
+        "evidence_digest": { "$ref": "#/$defs/digest" },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "closure_digest": { "$ref": "#/$defs/digest" },
+        "effect_digest": { "$ref": "#/$defs/digest" },
+        "target": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "gateDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "code", "lease_id", "assurance", "guarantee"],
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "code": { "type": "string", "minLength": 1 },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "assurance": { "enum": ["declared", "observed", "revalidated", "fenced"] },
+        "guarantee": { "type": "string", "minLength": 1 },
+        "receipt_id": { "type": ["string", "null"] },
+        "changed_dependencies": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "replayAssurance": {
+      "enum": ["deduplicated", "one_shot", "unknown"]
+    },
+    "fenceCoverage": {
+      "enum": ["full", "partial"]
+    },
+    "fencedOutcome": {
+      "enum": ["committed", "not_committed", "indeterminate"]
+    },
+    "fencedAttemptStatus": {
+      "enum": ["prepared", "committed", "not_committed", "indeterminate", "disputed"]
+    },
+    "targetPrecondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapter_id",
+        "mechanism",
+        "expected_token",
+        "protected_observations",
+        "replay_assurance"
+      ],
+      "properties": {
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "mechanism": { "type": "string", "minLength": 1 },
+        "expected_token": { "type": "string", "minLength": 1 },
+        "protected_observations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "replay_assurance": { "$ref": "#/$defs/replayAssurance" }
+      }
+    },
+    "fencedCommitRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt_id",
+        "lease_id",
+        "gate_receipt_id",
+        "adapter_id",
+        "effect",
+        "target",
+        "operation",
+        "closure_digest",
+        "effect_digest",
+        "precondition",
+        "precondition_digest",
+        "scope_digest",
+        "request_digest",
+        "coverage",
+        "prepared_at",
+        "expires_at"
+      ],
+      "properties": {
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "gate_receipt_id": { "type": "string", "minLength": 1 },
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "effect": {},
+        "target": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "closure_digest": { "$ref": "#/$defs/digest" },
+        "effect_digest": { "$ref": "#/$defs/digest" },
+        "precondition": { "$ref": "#/$defs/targetPrecondition" },
+        "precondition_digest": { "$ref": "#/$defs/digest" },
+        "scope_digest": { "$ref": "#/$defs/digest" },
+        "request_digest": { "$ref": "#/$defs/digest" },
+        "coverage": { "$ref": "#/$defs/fenceCoverage" },
+        "prepared_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "fencedAttempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt_id",
+        "lease_id",
+        "gate_receipt_id",
+        "adapter_id",
+        "request_digest",
+        "precondition_digest",
+        "scope_digest",
+        "replay_assurance",
+        "coverage",
+        "status",
+        "prepared_at",
+        "completed_at",
+        "result_digest"
+      ],
+      "properties": {
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "gate_receipt_id": { "type": "string", "minLength": 1 },
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "request_digest": { "$ref": "#/$defs/digest" },
+        "precondition_digest": { "$ref": "#/$defs/digest" },
+        "scope_digest": { "$ref": "#/$defs/digest" },
+        "replay_assurance": { "$ref": "#/$defs/replayAssurance" },
+        "coverage": { "$ref": "#/$defs/fenceCoverage" },
+        "status": { "$ref": "#/$defs/fencedAttemptStatus" },
+        "prepared_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": ["string", "null"], "format": "date-time" },
+        "result_digest": {
+          "anyOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+        }
+      }
+    },
+    "fencedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt_id",
+        "lease_id",
+        "adapter_id",
+        "outcome",
+        "request_digest",
+        "closure_digest",
+        "effect_digest",
+        "target",
+        "operation",
+        "precondition_digest",
+        "scope_digest",
+        "replay_assurance",
+        "coverage",
+        "target_result_digest",
+        "target_receipt_ref",
+        "committed_at"
+      ],
+      "properties": {
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "outcome": { "$ref": "#/$defs/fencedOutcome" },
+        "request_digest": { "$ref": "#/$defs/digest" },
+        "closure_digest": { "$ref": "#/$defs/digest" },
+        "effect_digest": { "$ref": "#/$defs/digest" },
+        "target": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "precondition_digest": { "$ref": "#/$defs/digest" },
+        "scope_digest": { "$ref": "#/$defs/digest" },
+        "replay_assurance": { "$ref": "#/$defs/replayAssurance" },
+        "coverage": { "$ref": "#/$defs/fenceCoverage" },
+        "target_result_digest": { "$ref": "#/$defs/digest" },
+        "target_receipt_ref": { "type": ["string", "null"], "minLength": 1 },
+        "committed_at": { "type": ["string", "null"], "format": "date-time" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "outcome": { "const": "committed" } } },
+          "then": {
+            "properties": {
+              "target_receipt_ref": { "type": "string", "minLength": 1 },
+              "committed_at": { "type": "string", "format": "date-time" }
+            }
+          },
+          "else": {
+            "properties": {
+              "target_receipt_ref": { "type": "null" },
+              "committed_at": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "fencedReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_id",
+        "attempt_id",
+        "lease_id",
+        "gate_receipt_id",
+        "assurance",
+        "adapter_id",
+        "request_digest",
+        "closure_digest",
+        "effect_digest",
+        "target",
+        "operation",
+        "precondition_digest",
+        "scope_digest",
+        "replay_assurance",
+        "coverage",
+        "target_result_digest",
+        "target_receipt_ref",
+        "committed_at",
+        "recorded_at",
+        "guarantee"
+      ],
+      "properties": {
+        "receipt_id": { "type": "string", "minLength": 1 },
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "gate_receipt_id": { "type": "string", "minLength": 1 },
+        "assurance": { "const": "fenced" },
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "request_digest": { "$ref": "#/$defs/digest" },
+        "closure_digest": { "$ref": "#/$defs/digest" },
+        "effect_digest": { "$ref": "#/$defs/digest" },
+        "target": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "precondition_digest": { "$ref": "#/$defs/digest" },
+        "scope_digest": { "$ref": "#/$defs/digest" },
+        "replay_assurance": { "const": "deduplicated" },
+        "coverage": { "const": "full" },
+        "target_result_digest": { "$ref": "#/$defs/digest" },
+        "target_receipt_ref": { "type": "string", "minLength": 1 },
+        "committed_at": { "type": "string", "format": "date-time" },
+        "recorded_at": { "type": "string", "format": "date-time" },
+        "guarantee": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

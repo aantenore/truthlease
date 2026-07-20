@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, cast
@@ -15,10 +15,12 @@ from truthlease.errors import (
     ArtifactNotFreshError,
     CoherenceFaultError,
     ConflictError,
+    FencedResultError,
     GraphLimitError,
     IncompleteDependencyError,
     InvalidDependencyError,
     NotFoundError,
+    TargetFenceError,
 )
 from truthlease.models import (
     Artifact,
@@ -30,6 +32,13 @@ from truthlease.models import (
     DependencyCompleteness,
     DependencyKind,
     DependencySnapshot,
+    FenceCoverage,
+    FencedAttempt,
+    FencedAttemptStatus,
+    FencedCommitRequest,
+    FencedOutcome,
+    FencedReceipt,
+    FencedResult,
     GateDecision,
     InvalidationResult,
     Lease,
@@ -39,6 +48,8 @@ from truthlease.models import (
     ReconcileAction,
     ReconciliationItem,
     ReconciliationPlan,
+    ReplayAssurance,
+    TargetPrecondition,
 )
 from truthlease.storage.sqlite import SQLiteStore, SQLiteUnitOfWork
 
@@ -56,6 +67,26 @@ _UNSET = _Unset()
 _DIGEST_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*:[A-Za-z0-9._~+/=-]+$")
 
 
+class _FrozenDict(dict[str, Any]):
+    """JSON-serializable immutable mapping used for outbound effect snapshots."""
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("fenced commit effects are immutable snapshots")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable  # type: ignore[assignment]
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable  # type: ignore[assignment]
+    setdefault = _immutable
+    update = _immutable
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> _FrozenDict:
+        return self
+
+
 class TruthLease:
     """Coordinate observations, immutable artifacts, invalidation, and validity leases."""
 
@@ -69,6 +100,7 @@ class TruthLease:
         max_graph_depth: int = 64,
         max_impact_nodes: int = 10_000,
         trusted_evidence_authorities: Collection[str] = (),
+        trusted_target_adapters: Collection[str] = (),
         max_evidence_age: timedelta = timedelta(seconds=5),
     ) -> None:
         if not boot_epoch:
@@ -79,6 +111,8 @@ class TruthLease:
             raise ValueError("max_evidence_age must be positive")
         if any(not authority.strip() for authority in trusted_evidence_authorities):
             raise ValueError("trusted evidence authorities must be non-empty strings")
+        if any(not adapter.strip() for adapter in trusted_target_adapters):
+            raise ValueError("trusted target adapters must be non-empty strings")
         self.store = store
         self.clock = clock or SystemClock()
         self.ids = ids or UUIDGenerator()
@@ -86,6 +120,7 @@ class TruthLease:
         self.max_graph_depth = max_graph_depth
         self.max_impact_nodes = max_impact_nodes
         self.trusted_evidence_authorities = frozenset(trusted_evidence_authorities)
+        self.trusted_target_adapters = frozenset(trusted_target_adapters)
         self.max_evidence_age = max_evidence_age
         self.store.initialize()
 
@@ -366,13 +401,14 @@ class TruthLease:
         operation: str,
         required_assurance: AssuranceLevel = AssuranceLevel.OBSERVED,
         ttl: timedelta = timedelta(seconds=30),
+        target_precondition: TargetPrecondition | None = None,
     ) -> Lease:
         """Bind a short-lived, single-use lease to an exact artifact and effect."""
         _require_text("target", target)
         _require_text("operation", operation)
         if ttl <= timedelta(0):
             raise ValueError("lease ttl must be positive")
-        effect_digest = digest_json(effect, domain=f"effect:{operation}:{target}")
+        effect_digest = digest_effect(effect, operation=operation, target=target)
 
         with self.store.transaction(write=True) as tx:
             now = self.clock.now()
@@ -449,7 +485,58 @@ class TruthLease:
                 expires_at=now + ttl,
                 boot_epoch=self.boot_epoch,
             )
+            fence_binding: tuple[str, str, FenceCoverage] | None = None
+            if target_precondition is not None:
+                coverage = _fence_coverage(lease.snapshot, target_precondition)
+                scope_digest = _scope_digest(lease.snapshot, target_precondition)
+                precondition_digest = _precondition_digest(
+                    target_precondition,
+                    target=target,
+                    operation=operation,
+                    scope_digest=scope_digest,
+                )
+                fence_binding = (precondition_digest, scope_digest, coverage)
+            if required_assurance is AssuranceLevel.FENCED:
+                if target_precondition is None or fence_binding is None:
+                    raise TargetFenceError(
+                        "fenced assurance requires a target precondition",
+                        details={"required_assurance": required_assurance.value},
+                    )
+                if closure_completeness is not DependencyCompleteness.OBSERVED:
+                    raise TargetFenceError(
+                        "fenced assurance requires observed dependency completeness"
+                    )
+                if target_precondition.adapter_id not in self.trusted_target_adapters:
+                    raise TargetFenceError(
+                        "target adapter is not allowlisted",
+                        details={"adapter_id": target_precondition.adapter_id},
+                    )
+                if target_precondition.replay_assurance is not ReplayAssurance.DEDUPLICATED:
+                    raise TargetFenceError("fenced assurance requires deduplicated target replay")
+                if fence_binding[2] is not FenceCoverage.FULL:
+                    raise TargetFenceError(
+                        "fenced assurance requires exact full observation-closure coverage",
+                        details={
+                            "protected_observations": sorted(
+                                target_precondition.protected_observations
+                            ),
+                            "lease_observations": sorted(item.key for item in lease.snapshot),
+                        },
+                    )
             tx.insert_lease(lease)
+            if target_precondition is not None and fence_binding is not None:
+                precondition_digest, scope_digest, coverage = fence_binding
+                tx.insert_lease_fence_binding(
+                    lease_id=lease.lease_id,
+                    adapter_id=target_precondition.adapter_id,
+                    mechanism=target_precondition.mechanism,
+                    precondition_digest=precondition_digest,
+                    scope_digest=scope_digest,
+                    coverage=coverage,
+                    replay_assurance=target_precondition.replay_assurance,
+                    protected_observations=target_precondition.protected_observations,
+                    created_at=utc_text(now),
+                )
             event_data: dict[str, Any] = {
                 "lease_id": lease.lease_id,
                 "artifact_id": artifact.artifact_id,
@@ -527,7 +614,7 @@ class TruthLease:
             lease = tx.get_lease(lease_id)
             if lease is None:
                 raise NotFoundError("lease does not exist", details={"lease_id": lease_id})
-            effect_digest = digest_json(effect, domain=f"effect:{lease.operation}:{lease.target}")
+            effect_digest = digest_effect(effect, operation=lease.operation, target=lease.target)
             local_assurance = _assurance_for_completeness(lease.dependency_completeness)
             if effect_digest != lease.effect_digest:
                 return GateDecision(
@@ -665,6 +752,394 @@ class TruthLease:
                 guarantee=guarantee,
                 receipt_id=receipt_id,
             )
+
+    def prepare_fenced_commit(
+        self,
+        lease_id: str,
+        effect: Digestable,
+        target_precondition: TargetPrecondition,
+        evidence: AssuranceEvidence | None = None,
+    ) -> FencedCommitRequest:
+        """Consume a lease and durably prepare one target-side commit attempt.
+
+        This method performs local SQLite work only. The returned request is
+        executed by an adapter after the transaction commits. Repeating the
+        call with identical inputs returns the same attempt; different inputs
+        for the consumed lease are rejected.
+        """
+        _require_text("lease_id", lease_id)
+        with self.store.transaction(write=True) as tx:
+            now = self.clock.now()
+            lease = tx.get_lease(lease_id)
+            if lease is None:
+                raise NotFoundError("lease does not exist", details={"lease_id": lease_id})
+            effect_snapshot = _freeze_digestable(effect)
+            effect_digest = digest_effect(
+                effect_snapshot, operation=lease.operation, target=lease.target
+            )
+            binding = tx.get_lease_fence_binding(lease_id)
+            if binding is None:
+                raise TargetFenceError(
+                    "lease has no target fence binding",
+                    details={"lease_id": lease_id},
+                )
+            if target_precondition.adapter_id not in self.trusted_target_adapters:
+                raise TargetFenceError(
+                    "target adapter is not allowlisted",
+                    details={"adapter_id": target_precondition.adapter_id},
+                )
+            coverage = _fence_coverage(lease.snapshot, target_precondition)
+            scope_digest = _scope_digest(lease.snapshot, target_precondition)
+            precondition_digest = _precondition_digest(
+                target_precondition,
+                target=lease.target,
+                operation=lease.operation,
+                scope_digest=scope_digest,
+            )
+            self._require_matching_fence_binding(
+                binding=binding,
+                target_precondition=target_precondition,
+                precondition_digest=precondition_digest,
+                scope_digest=scope_digest,
+                coverage=coverage,
+            )
+            if lease.dependency_completeness is not DependencyCompleteness.OBSERVED:
+                raise TargetFenceError(
+                    "target commit preparation requires observed dependency completeness"
+                )
+
+            existing = tx.get_fenced_attempt_for_lease(lease_id)
+            if existing is not None:
+                request_digest = _fenced_request_digest(
+                    attempt_id=existing.attempt_id,
+                    lease=lease,
+                    gate_receipt_id=existing.gate_receipt_id,
+                    adapter_id=target_precondition.adapter_id,
+                    precondition_digest=precondition_digest,
+                    scope_digest=scope_digest,
+                    replay_assurance=target_precondition.replay_assurance,
+                    coverage=coverage,
+                    prepared_at=existing.prepared_at,
+                )
+                if (
+                    effect_digest != lease.effect_digest
+                    or existing.adapter_id != target_precondition.adapter_id
+                    or existing.precondition_digest != precondition_digest
+                    or existing.scope_digest != scope_digest
+                    or existing.replay_assurance is not target_precondition.replay_assurance
+                    or existing.coverage is not coverage
+                    or existing.request_digest != request_digest
+                ):
+                    raise ConflictError(
+                        "consumed lease already has a different fenced attempt",
+                        details={
+                            "lease_id": lease_id,
+                            "attempt_id": existing.attempt_id,
+                        },
+                    )
+                return FencedCommitRequest(
+                    attempt_id=existing.attempt_id,
+                    lease_id=lease.lease_id,
+                    gate_receipt_id=existing.gate_receipt_id,
+                    adapter_id=existing.adapter_id,
+                    effect=effect_snapshot,
+                    target=lease.target,
+                    operation=lease.operation,
+                    closure_digest=lease.closure_digest,
+                    effect_digest=lease.effect_digest,
+                    precondition=target_precondition,
+                    precondition_digest=precondition_digest,
+                    scope_digest=scope_digest,
+                    request_digest=request_digest,
+                    coverage=coverage,
+                    prepared_at=existing.prepared_at,
+                    expires_at=lease.expires_at,
+                )
+
+            if effect_digest != lease.effect_digest:
+                raise ConflictError(
+                    "effect does not match the lease",
+                    details={"lease_id": lease_id},
+                )
+            failure = self._lease_failure(tx, lease, now=now)
+            if failure:
+                code, changed, _terminal = failure
+                raise TargetFenceError(
+                    "lease cannot prepare a target commit",
+                    details={"lease_id": lease_id, "code": code, "changed": changed},
+                )
+            if evidence is None:
+                raise TargetFenceError(
+                    "fresh authoritative revalidation evidence is required",
+                    details={"lease_id": lease_id},
+                )
+            if not self._valid_revalidation_evidence(evidence, lease=lease, now=now):
+                raise TargetFenceError(
+                    "authoritative revalidation evidence is invalid",
+                    details={"lease_id": lease_id, "authority": evidence.authority},
+                )
+
+            attempt_id = self.ids.new("attempt")
+            gate_receipt_id = self.ids.new("receipt")
+            request_digest = _fenced_request_digest(
+                attempt_id=attempt_id,
+                lease=lease,
+                gate_receipt_id=gate_receipt_id,
+                adapter_id=target_precondition.adapter_id,
+                precondition_digest=precondition_digest,
+                scope_digest=scope_digest,
+                replay_assurance=target_precondition.replay_assurance,
+                coverage=coverage,
+                prepared_at=now,
+            )
+            tx.set_lease_status(lease_id, LeaseStatus.CONSUMED, consumed_at=utc_text(now))
+            tx.insert_receipt(
+                receipt_id=gate_receipt_id,
+                lease_id=lease_id,
+                assurance=AssuranceLevel.REVALIDATED,
+                effect_digest=effect_digest,
+                created_at=utc_text(now),
+                guarantee=_guarantee_for(AssuranceLevel.REVALIDATED),
+                evidence=evidence,
+            )
+            attempt = FencedAttempt(
+                attempt_id=attempt_id,
+                lease_id=lease_id,
+                gate_receipt_id=gate_receipt_id,
+                adapter_id=target_precondition.adapter_id,
+                request_digest=request_digest,
+                precondition_digest=precondition_digest,
+                scope_digest=scope_digest,
+                replay_assurance=target_precondition.replay_assurance,
+                coverage=coverage,
+                status=FencedAttemptStatus.PREPARED,
+                prepared_at=now,
+            )
+            tx.insert_fenced_attempt(attempt)
+            event_data: dict[str, Any] = {
+                "attempt_id": attempt_id,
+                "lease_id": lease_id,
+                "gate_receipt_id": gate_receipt_id,
+                "adapter_id": target_precondition.adapter_id,
+                "request_digest": request_digest,
+                "precondition_digest": precondition_digest,
+                "scope_digest": scope_digest,
+                "coverage": coverage.value,
+                "replay_assurance": target_precondition.replay_assurance.value,
+            }
+            tx.record_event(
+                source="urn:truthlease:runtime",
+                event_id=self.ids.new("evt"),
+                event_type="dev.truthlease.fenced-attempt.prepared.v1",
+                subject=f"fenced-attempt/{attempt_id}",
+                payload_digest=digest_json(event_data, domain="event:fenced-attempt"),
+                occurred_at=utc_text(now),
+                data=event_data,
+            )
+            return FencedCommitRequest(
+                attempt_id=attempt_id,
+                lease_id=lease_id,
+                gate_receipt_id=gate_receipt_id,
+                adapter_id=target_precondition.adapter_id,
+                effect=effect_snapshot,
+                target=lease.target,
+                operation=lease.operation,
+                closure_digest=lease.closure_digest,
+                effect_digest=effect_digest,
+                precondition=target_precondition,
+                precondition_digest=precondition_digest,
+                scope_digest=scope_digest,
+                request_digest=request_digest,
+                coverage=coverage,
+                prepared_at=now,
+                expires_at=lease.expires_at,
+            )
+
+    def record_fenced_result(self, result: FencedResult) -> FencedReceipt | None:
+        """Record one adapter result and derive fenced assurance when warranted."""
+        if not isinstance(result, FencedResult):
+            raise TypeError("result must be a FencedResult")
+        if (
+            not isinstance(result.outcome, FencedOutcome)
+            or not isinstance(result.replay_assurance, ReplayAssurance)
+            or not isinstance(result.coverage, FenceCoverage)
+        ):
+            raise FencedResultError("target result contains invalid enum values")
+        result_digest = _fenced_result_digest(result)
+        conflict: dict[str, Any] | None = None
+        derived_receipt: FencedReceipt | None = None
+        with self.store.transaction(write=True) as tx:
+            now = self.clock.now()
+            attempt = tx.get_fenced_attempt(result.attempt_id)
+            if attempt is None:
+                raise NotFoundError(
+                    "fenced attempt does not exist",
+                    details={"attempt_id": result.attempt_id},
+                )
+            lease = tx.get_lease(attempt.lease_id)
+            if lease is None:
+                raise RuntimeError("fenced attempt references a missing lease")
+            binding = tx.get_lease_fence_binding(lease.lease_id)
+            if binding is None:
+                raise FencedResultError(
+                    "fenced attempt has no durable target binding",
+                    details={"attempt_id": result.attempt_id},
+                )
+            self._require_matching_fenced_result(
+                result=result,
+                attempt=attempt,
+                lease=lease,
+                binding=binding,
+            )
+
+            if attempt.status is FencedAttemptStatus.DISPUTED:
+                raise ConflictError(
+                    "fenced attempt is disputed",
+                    details={"attempt_id": result.attempt_id},
+                )
+            existing_result_id = tx.get_fenced_result_id(result.attempt_id, result_digest)
+            if existing_result_id is not None:
+                return tx.get_fenced_receipt(result.attempt_id)
+
+            result_id = self.ids.new("result")
+            tx.insert_fenced_result(
+                result_id=result_id,
+                result_digest=result_digest,
+                result=result,
+                recorded_at=utc_text(now),
+            )
+            if attempt.status in {
+                FencedAttemptStatus.COMMITTED,
+                FencedAttemptStatus.NOT_COMMITTED,
+            }:
+                if result.outcome is FencedOutcome.INDETERMINATE:
+                    derived_receipt = tx.get_fenced_receipt(attempt.attempt_id)
+                    event_data = {
+                        "attempt_id": attempt.attempt_id,
+                        "lease_id": lease.lease_id,
+                        "result_digest": result_digest,
+                        "outcome": result.outcome.value,
+                        "preserved_terminal_status": attempt.status.value,
+                        "fenced_receipt_id": (
+                            derived_receipt.receipt_id if derived_receipt is not None else None
+                        ),
+                    }
+                    tx.record_event(
+                        source="urn:truthlease:runtime",
+                        event_id=self.ids.new("evt"),
+                        event_type="dev.truthlease.fenced-attempt.late-indeterminate.v1",
+                        subject=f"fenced-attempt/{attempt.attempt_id}",
+                        payload_digest=digest_json(
+                            event_data, domain="event:fenced-late-indeterminate"
+                        ),
+                        occurred_at=utc_text(now),
+                        data=event_data,
+                    )
+                else:
+                    reason = (
+                        "conflicting terminal target result; "
+                        f"attempt={attempt.attempt_id}; prior={attempt.result_digest}; "
+                        f"new={result_digest}"
+                    )
+                    tx.set_fenced_attempt_result(
+                        attempt.attempt_id,
+                        status=FencedAttemptStatus.DISPUTED,
+                        completed_at=utc_text(now),
+                        result_digest=result_digest,
+                    )
+                    invalidated_count = tx.fail_closed(reason=reason, at=utc_text(now))
+                    conflict = {
+                        "attempt_id": attempt.attempt_id,
+                        "prior_result_digest": attempt.result_digest,
+                        "new_result_digest": result_digest,
+                        "invalidated_lease_count": invalidated_count,
+                    }
+                    event_data = {**conflict, "reason": reason}
+                    tx.record_event(
+                        source="urn:truthlease:runtime",
+                        event_id=self.ids.new("evt"),
+                        event_type="dev.truthlease.fenced-attempt.disputed.v1",
+                        subject=f"fenced-attempt/{attempt.attempt_id}",
+                        payload_digest=digest_json(event_data, domain="event:fenced-dispute"),
+                        occurred_at=utc_text(now),
+                        data=event_data,
+                    )
+            else:
+                status = FencedAttemptStatus(result.outcome.value)
+                completed_at = (
+                    None if result.outcome is FencedOutcome.INDETERMINATE else utc_text(now)
+                )
+                tx.set_fenced_attempt_result(
+                    attempt.attempt_id,
+                    status=status,
+                    completed_at=completed_at,
+                    result_digest=result_digest,
+                )
+                if (
+                    result.outcome is FencedOutcome.COMMITTED
+                    and result.coverage is FenceCoverage.FULL
+                    and result.replay_assurance is ReplayAssurance.DEDUPLICATED
+                ):
+                    if result.target_receipt_ref is None or result.committed_at is None:
+                        raise RuntimeError("validated committed result is incomplete")
+                    derived_receipt = FencedReceipt(
+                        receipt_id=self.ids.new("fenced_receipt"),
+                        attempt_id=attempt.attempt_id,
+                        lease_id=lease.lease_id,
+                        gate_receipt_id=attempt.gate_receipt_id,
+                        assurance=AssuranceLevel.FENCED,
+                        adapter_id=attempt.adapter_id,
+                        request_digest=attempt.request_digest,
+                        closure_digest=lease.closure_digest,
+                        effect_digest=lease.effect_digest,
+                        target=lease.target,
+                        operation=lease.operation,
+                        precondition_digest=attempt.precondition_digest,
+                        scope_digest=attempt.scope_digest,
+                        replay_assurance=result.replay_assurance,
+                        coverage=result.coverage,
+                        target_result_digest=result.target_result_digest,
+                        target_receipt_ref=result.target_receipt_ref,
+                        committed_at=result.committed_at,
+                        recorded_at=now,
+                        guarantee=_fenced_guarantee(),
+                    )
+                    tx.insert_fenced_receipt(derived_receipt, result_id=result_id)
+                event_data = {
+                    "attempt_id": attempt.attempt_id,
+                    "lease_id": lease.lease_id,
+                    "result_digest": result_digest,
+                    "outcome": result.outcome.value,
+                    "fenced_receipt_id": (
+                        derived_receipt.receipt_id if derived_receipt is not None else None
+                    ),
+                }
+                tx.record_event(
+                    source="urn:truthlease:runtime",
+                    event_id=self.ids.new("evt"),
+                    event_type="dev.truthlease.fenced-attempt.result-recorded.v1",
+                    subject=f"fenced-attempt/{attempt.attempt_id}",
+                    payload_digest=digest_json(event_data, domain="event:fenced-result"),
+                    occurred_at=utc_text(now),
+                    data=event_data,
+                )
+        if conflict is not None:
+            raise ConflictError("conflicting terminal target result", details=conflict)
+        return derived_receipt
+
+    def get_fenced_attempt(self, attempt_id: str) -> FencedAttempt | None:
+        with self.store.transaction(write=False) as tx:
+            return tx.get_fenced_attempt(attempt_id)
+
+    def get_fenced_receipt(self, attempt_id: str) -> FencedReceipt | None:
+        with self.store.transaction(write=False) as tx:
+            attempt = tx.get_fenced_attempt(attempt_id)
+            if attempt is not None and attempt.status is FencedAttemptStatus.DISPUTED:
+                raise ConflictError(
+                    "fenced attempt is disputed; its historical receipt is not valid",
+                    details={"attempt_id": attempt_id},
+                )
+            return tx.get_fenced_receipt(attempt_id)
 
     def get_artifact(self, artifact_id: str, revision: int | None = None) -> Artifact:
         with self.store.transaction(write=False) as tx:
@@ -1104,6 +1579,93 @@ class TruthLease:
                 queue.append((child, depth + 1))
         return descendants
 
+    def _valid_revalidation_evidence(
+        self,
+        evidence: AssuranceEvidence,
+        *,
+        lease: Lease,
+        now: datetime,
+    ) -> bool:
+        return (
+            evidence.level is AssuranceLevel.REVALIDATED
+            and evidence.authority in self.trusted_evidence_authorities
+            and evidence.lease_id == lease.lease_id
+            and evidence.closure_digest == lease.closure_digest
+            and evidence.effect_digest == lease.effect_digest
+            and evidence.target == lease.target
+            and evidence.operation == lease.operation
+            and evidence.observed_at >= lease.issued_at
+            and evidence.observed_at <= now
+            and now - evidence.observed_at <= self.max_evidence_age
+        )
+
+    @staticmethod
+    def _require_matching_fence_binding(
+        *,
+        binding: dict[str, Any],
+        target_precondition: TargetPrecondition,
+        precondition_digest: str,
+        scope_digest: str,
+        coverage: FenceCoverage,
+    ) -> None:
+        supplied_observations = tuple(sorted(target_precondition.protected_observations))
+        expected_observations = tuple(sorted(binding["protected_observations"]))
+        if (
+            binding["adapter_id"] != target_precondition.adapter_id
+            or binding["mechanism"] != target_precondition.mechanism
+            or binding["precondition_digest"] != precondition_digest
+            or binding["scope_digest"] != scope_digest
+            or binding["coverage"] is not coverage
+            or binding["replay_assurance"] is not target_precondition.replay_assurance
+            or expected_observations != supplied_observations
+        ):
+            raise TargetFenceError(
+                "target precondition does not match the lease binding",
+                details={"lease_id": binding["lease_id"]},
+            )
+
+    @staticmethod
+    def _require_matching_fenced_result(
+        *,
+        result: FencedResult,
+        attempt: FencedAttempt,
+        lease: Lease,
+        binding: dict[str, Any],
+    ) -> None:
+        mismatches: list[str] = []
+        expected = {
+            "lease_id": lease.lease_id,
+            "adapter_id": attempt.adapter_id,
+            "request_digest": attempt.request_digest,
+            "closure_digest": lease.closure_digest,
+            "effect_digest": lease.effect_digest,
+            "target": lease.target,
+            "operation": lease.operation,
+            "precondition_digest": attempt.precondition_digest,
+            "scope_digest": attempt.scope_digest,
+            "replay_assurance": attempt.replay_assurance,
+            "coverage": attempt.coverage,
+        }
+        for name, value in expected.items():
+            if getattr(result, name) != value:
+                mismatches.append(name)
+        if (
+            binding["adapter_id"] != attempt.adapter_id
+            or binding["precondition_digest"] != attempt.precondition_digest
+            or binding["scope_digest"] != attempt.scope_digest
+            or binding["replay_assurance"] is not attempt.replay_assurance
+            or binding["coverage"] is not attempt.coverage
+        ):
+            mismatches.append("lease_fence_binding")
+        if mismatches:
+            raise FencedResultError(
+                "target result does not match the prepared attempt",
+                details={
+                    "attempt_id": attempt.attempt_id,
+                    "mismatches": sorted(set(mismatches)),
+                },
+            )
+
     @staticmethod
     def _raise_if_faulted(tx: SQLiteUnitOfWork) -> None:
         fault = tx.get_coherence_fault()
@@ -1112,6 +1674,151 @@ class TruthLease:
                 "runtime is fail-closed after an incomplete invalidation",
                 details={"fault": fault},
             )
+
+
+def _protected_snapshot(
+    snapshot: Sequence[DependencySnapshot],
+    target_precondition: TargetPrecondition,
+) -> list[DependencySnapshot]:
+    by_key = {item.key: item for item in snapshot}
+    unknown = sorted(set(target_precondition.protected_observations) - set(by_key))
+    if unknown:
+        raise TargetFenceError(
+            "target precondition names observations outside the lease closure",
+            details={"unknown_observations": unknown},
+        )
+    return [by_key[key] for key in sorted(target_precondition.protected_observations)]
+
+
+def digest_effect(effect: Digestable, *, operation: str, target: str) -> str:
+    """Digest an effect with the single domain used by lease and adapter paths."""
+    _require_text("operation", operation)
+    _require_text("target", target)
+    return digest_json(effect, domain=f"effect:{operation}:{target}")
+
+
+def _freeze_digestable(value: Digestable) -> Digestable:
+    """Take an immutable, JSON-compatible deep snapshot of an effect."""
+    if isinstance(value, Mapping):
+        frozen: dict[str, Digestable] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("canonical JSON object keys must be strings")
+            frozen[key] = _freeze_digestable(item)
+        return cast(Digestable, _FrozenDict(frozen))
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return cast(Digestable, tuple(_freeze_digestable(item) for item in value))
+    return value
+
+
+def _fence_coverage(
+    snapshot: Sequence[DependencySnapshot],
+    target_precondition: TargetPrecondition,
+) -> FenceCoverage:
+    _protected_snapshot(snapshot, target_precondition)
+    protected = set(target_precondition.protected_observations)
+    lease_keys = {item.key for item in snapshot}
+    return FenceCoverage.FULL if protected == lease_keys else FenceCoverage.PARTIAL
+
+
+def _scope_digest(
+    snapshot: Sequence[DependencySnapshot],
+    target_precondition: TargetPrecondition,
+) -> str:
+    protected = _protected_snapshot(snapshot, target_precondition)
+    scope_data: dict[str, Any] = {
+        "observations": [
+            {
+                "key": item.key,
+                "version": item.version,
+                "generation": item.generation,
+                "digest": item.digest,
+            }
+            for item in protected
+        ]
+    }
+    return digest_json(scope_data, domain="target-fence:scope:v1")
+
+
+def _precondition_digest(
+    target_precondition: TargetPrecondition,
+    *,
+    target: str,
+    operation: str,
+    scope_digest: str,
+) -> str:
+    precondition_data: dict[str, Any] = {
+        "adapter_id": target_precondition.adapter_id,
+        "mechanism": target_precondition.mechanism,
+        "expected_token": target_precondition.expected_token,
+        "protected_observations": sorted(target_precondition.protected_observations),
+        "replay_assurance": target_precondition.replay_assurance.value,
+        "scope_digest": scope_digest,
+        "target": target,
+        "operation": operation,
+    }
+    return digest_json(precondition_data, domain="target-fence:precondition:v1")
+
+
+def _fenced_request_digest(
+    *,
+    attempt_id: str,
+    lease: Lease,
+    gate_receipt_id: str,
+    adapter_id: str,
+    precondition_digest: str,
+    scope_digest: str,
+    replay_assurance: ReplayAssurance,
+    coverage: FenceCoverage,
+    prepared_at: datetime,
+) -> str:
+    request_data: dict[str, Any] = {
+        "attempt_id": attempt_id,
+        "lease_id": lease.lease_id,
+        "gate_receipt_id": gate_receipt_id,
+        "adapter_id": adapter_id,
+        "closure_digest": lease.closure_digest,
+        "effect_digest": lease.effect_digest,
+        "target": lease.target,
+        "operation": lease.operation,
+        "precondition_digest": precondition_digest,
+        "scope_digest": scope_digest,
+        "replay_assurance": replay_assurance.value,
+        "coverage": coverage.value,
+        "prepared_at": utc_text(prepared_at),
+        "expires_at": utc_text(lease.expires_at),
+    }
+    return digest_json(request_data, domain="target-fence:request:v1")
+
+
+def _fenced_result_digest(result: FencedResult) -> str:
+    result_data: dict[str, Any] = {
+        "attempt_id": result.attempt_id,
+        "lease_id": result.lease_id,
+        "adapter_id": result.adapter_id,
+        "outcome": result.outcome.value,
+        "request_digest": result.request_digest,
+        "closure_digest": result.closure_digest,
+        "effect_digest": result.effect_digest,
+        "target": result.target,
+        "operation": result.operation,
+        "precondition_digest": result.precondition_digest,
+        "scope_digest": result.scope_digest,
+        "replay_assurance": result.replay_assurance.value,
+        "coverage": result.coverage.value,
+        "target_result_digest": result.target_result_digest,
+        "target_receipt_ref": result.target_receipt_ref,
+        "committed_at": utc_text(result.committed_at) if result.committed_at else None,
+    }
+    return digest_json(result_data, domain="target-fence:result:v1")
+
+
+def _fenced_guarantee() -> str:
+    return (
+        "An allowlisted target adapter reported a committed effect under the exact "
+        "lease-bound precondition, with full observation-closure coverage and "
+        "deduplicated replay. TruthLease recorded the target result after commit."
+    )
 
 
 def _guarantee_for(level: AssuranceLevel) -> str:

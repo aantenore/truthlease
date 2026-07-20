@@ -3,6 +3,31 @@
 All notable changes to TruthLease are documented here. The project follows
 [Semantic Versioning](https://semver.org/) once its public contract stabilizes.
 
+## 0.2.0-alpha.1 - 2026-07-20
+
+Target-fencing vertical slice:
+
+- additive two-phase API that prepares a bound target attempt, executes outside
+  SQLite, and records a post-commit result;
+- target preconditions bound to adapter, mechanism, expected token, protected
+  observation scope, and replay assurance;
+- core-derived `fenced` receipts only for committed, deduplicated, full-closure
+  results;
+- explicit `not_committed`, `indeterminate`, and fail-closed disputed outcomes;
+- stable attempt identity and idempotent result replay without persisting raw
+  effects, target tokens, credentials, or response bodies;
+- strict zero-dependency HTTP reference profile for strong ETag conditional
+  commits with bounded responses and no redirects;
+- transactional SQLite schema migration from v1 to v2 with no synthetic fenced
+  backfill;
+- self-contained JSON contract v2 while the bundled v1 contract remains
+  byte-identical and the default;
+- target correctness, migration, packaging, and protocol-conformance tests;
+- CodeQL analysis and tag-triggered release smoke tests.
+
+The alpha does not promise distributed transactions, external exactly-once
+execution, multi-target atomicity, or freshness after the recorded commit.
+
 ## 0.1.0-alpha.1 - 2026-07-20
 
 Initial executable alpha:

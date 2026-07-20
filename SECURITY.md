@@ -17,5 +17,7 @@ known workaround. Operational traces should be minimized and redacted.
 
 TruthLease does not authenticate external sources, sandbox Python adapters,
 provide tenant isolation, or create a distributed transaction with a target.
-Those properties belong to the embedding application. See the
+The embedding application must allowlist adapter identities and exact endpoints,
+secure target credentials, and verify that declared precondition coverage matches
+the target implementation. See the
 [threat model](docs/threat-model.md) before using the alpha near durable effects.

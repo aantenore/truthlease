@@ -102,7 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("graph", help="export the artifact graph as JSON")
     subcommands.add_parser("events", help="export the append-only event history")
     subcommands.add_parser("doctor", help="verify SQLite integrity and safety settings")
-    subcommands.add_parser("schema", help="print the bundled v1 contract schema")
+    schema = subcommands.add_parser("schema", help="print a bundled contract schema")
+    schema.add_argument("--version", choices=("v1", "v2"), default="v1")
     return parser
 
 
@@ -113,7 +114,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "demo":
             output = run_demo(Path(args.path), reset=args.reset)
         elif args.command == "schema":
-            output = load_coherence_schema()
+            output = load_coherence_schema(args.version)
         else:
             settings = Settings.from_env()
             database_path = Path(args.db) if args.db else settings.database_path

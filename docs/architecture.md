@@ -8,9 +8,10 @@ narrow question at use time:
 > to this runtime?
 
 It does not interpret natural language, schedule workflows, retrieve memory, or
-perform remote effects. When a dependency changes, it calculates a reconciliation
-plan only when the application asks for one; it does not enqueue or execute that
-work.
+coordinate transactions across targets. When a dependency changes, it calculates
+a reconciliation plan only when the application asks for one; it does not enqueue
+or execute that work. Its optional target path invokes one explicit adapter after
+the local transaction has closed.
 
 ## Guarantee boundary
 
@@ -21,8 +22,10 @@ The local guarantee is:
 > completes.
 
 This is linearizable relative to the local SQLite store. It is not a distributed
-transaction with a remote source or target. End-to-end safety additionally
-requires target-side fencing such as an atomic version precondition.
+transaction with a remote source or target. The `fenced` level additionally
+requires one trusted adapter to report a target-side conditional commit bound to
+the exact effect and full protected observation closure. That receipt is a
+historical commit fact, not a claim of ongoing freshness.
 
 ## Components
 
@@ -63,8 +66,9 @@ flowchart TB
     Obs & Art & Inv & Lease & Gate --> Events
 ```
 
-Only the core is implemented in `0.1.0-alpha.1`. Adapters are explicit extension
-boundaries, not bundled provider integrations.
+The deterministic core, SQLite adapter, and strict HTTP conformance profile are
+implemented in `0.2.0-alpha.1`. Provider integrations remain explicit extension
+boundaries rather than hidden dependencies.
 
 ## Domain objects
 
@@ -132,6 +136,11 @@ artifact therefore cannot relabel declared upstream evidence as observed.
 Leases are single-use. `consumed`, `expired`, `invalidated`, and `revoked` are
 terminal states.
 
+An optional target-precondition binding is stored separately so the closed v1
+lease read model remains unchanged. It binds the adapter and mechanism, a digest
+of the opaque expected token, replay assurance, and a digest of the exact
+observation snapshots claimed to be protected. Raw target tokens are not stored.
+
 `validate_lease()` is a non-consuming, local-currentness check. It may deny an
 otherwise current lease when the requested assurance is above what the local
 store can establish. `gate_effect()` additionally binds and consumes the exact
@@ -140,9 +149,41 @@ responsible for dispatch.
 
 Revalidation evidence must be fresh, come from a configured authority allowlist,
 and bind the lease ID, closure digest, effect digest, target, and operation. The
-levels are cumulative: a future `fenced` result must retain the local and any
-required revalidation evidence and add proof that the target atomically enforced
-the bound precondition. The alpha reserves `fenced` and never emits it.
+levels are cumulative: a `fenced` result retains the local and any required
+revalidation evidence and adds a target result bound to the same lease, closure,
+effect, target, operation, precondition, and protected scope.
+
+## Target-fencing protocol
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant L as TruthLease / SQLite
+    participant X as Trusted target adapter
+    participant T as Cooperating target
+    A->>L: prepare_fenced_commit(lease, effect, precondition)
+    L->>L: validate, consume lease, persist immutable attempt
+    L-->>A: bound commit request
+    A->>X: commit(request), outside SQLite transaction
+    X->>T: conditional request + stable attempt identity
+    T-->>X: bound result or certain rejection
+    X-->>A: committed / not_committed / indeterminate
+    A->>L: record_fenced_result(result)
+    L-->>A: fenced receipt only for verified full-coverage commit
+```
+
+Preparation is idempotent only for identical inputs. Once dispatch may have
+occurred, recovery reuses the same attempt and fingerprint. An ambiguous result
+cannot be promoted and cannot be replaced with a new attempt. A conflicting
+result marks the attempt disputed.
+
+The HTTP profile is intentionally strict: strong ETag only, canonical JSON,
+stable idempotency key, fixed endpoint, no redirects, bounded response, and
+explicit response bindings. For a previously unseen attempt, `412` means the
+protected effect was not applied. A conforming target resolves a known attempt
+and verifies its original request fingerprint before evaluating the current
+ETag, so retry after a lost response cannot turn an earlier commit into `412`.
+A `2xx` without the required evidence remains indeterminate.
 
 ## Freshness predicate
 
@@ -216,9 +257,10 @@ BEGIN IMMEDIATE for writes
 bounded busy_timeout
 ```
 
-A single writer is an intentional MVP constraint. Two concurrent gate attempts
-serialize; only one can consume the lease. No network request is made while a
-database transaction is open.
+A single writer is an intentional MVP constraint. Two concurrent gate or prepare
+attempts serialize; only one can consume the lease. The prepared request is
+returned after commit, so no network request is made while a database transaction
+is open. Finalization is a separate write transaction.
 
 Rollback journaling is the conservative default. SQLite documents a historical
 [WAL-reset concurrency issue](https://www.sqlite.org/wal.html#the_wal_reset_bug),
@@ -228,7 +270,7 @@ enabled.
 ## Dependency direction
 
 ```text
-CLI / future HTTP adapter
+CLI / target adapter
         ↓
 application service (TruthLease)
         ↓

@@ -1,10 +1,11 @@
-# Delivery contract: TruthLease 0.1 alpha
+# Delivery contract: TruthLease 0.2 alpha
 
 ## Objective
 
 Deliver an executable, provider-neutral coherence control plane that prevents an
 application from dispatching an effect through a lease after a known dependency
-of its source artifact changed.
+of its source artifact changed, and can produce a post-commit receipt when one
+cooperating target atomically enforces the bound state.
 
 ## Must
 
@@ -23,9 +24,18 @@ of its source artifact changed.
   target, operation, assurance requirement, and expiration.
 - Validate and consume one lease atomically with a receipt; keep denial results
   explicit without claiming every attempt is journaled.
-- Bind revalidation evidence to the lease and proposed effect, enforce evidence
-  freshness and an authority allowlist, and reserve cumulative `fenced` assurance
-  for a future target-side commit result.
+- Bind revalidation evidence to the lease and proposed effect and enforce
+  evidence freshness and an authority allowlist.
+- Bind one target attempt to the lease, effect, adapter, precondition, replay
+  contract, and exact protected observation scope without changing the v1 lease
+  read model.
+- Execute the target adapter only after the SQLite transaction closes.
+- Derive cumulative `fenced` assurance only from a verified, deduplicated target
+  commit that covers the full required observation closure.
+- Keep certain rejection, ambiguous outcome, and conflicting result replay
+  distinct and fail closed.
+- Never redispatch an attempt already known as committed or not committed, and
+  never let a late transport ambiguity erase a terminal fact.
 - Make guarantee and dependency-completeness limits visible.
 - Cap derived and leased completeness at the weakest required transitive
   dependency.
@@ -38,11 +48,13 @@ of its source artifact changed.
 - Demonstrate partial reuse after policy drift.
 - Emit an append-only, deduplicated history of accepted lifecycle events.
 - Ship architecture, protocol, threat-model, and benchmark documentation.
+- Preserve a byte-identical JSON v1 contract and ship a self-contained v2
+  contract plus transactional SQLite v1-to-v2 migration.
 
 ## Out of scope
 
 - Workflow scheduling, model routing, memory retrieval, CDC, authorization,
-  distributed transactions, effect delivery, and compensation.
+  distributed transactions, multi-target atomicity, and compensation.
 - Inferring undeclared causal dependencies.
 - Claiming source truth or end-to-end freshness without target fencing.
 - Claiming cross-language digest identity before a versioned canonicalization
@@ -57,6 +69,17 @@ of its source artifact changed.
 - Expired, consumed, mismatched, and invalidated leases fail closed.
 - Lease validation checks local currentness without consumption and denies when
   additional revalidation or fencing assurance is required.
+- Concurrent prepare calls create at most one immutable attempt per lease.
+- A changed target precondition produces a certain non-commit; a lost response
+  remains indeterminate and is never promoted automatically.
+- Identical result replay is idempotent; conflicting evidence marks the attempt
+  disputed.
+- Re-entering the high-level execution helper after a terminal result returns
+  the known receipt or non-commit without another adapter call.
+- A conformance fake target proves conditional update and deduplication in the
+  same target-side critical section and one effect under ambiguous retry.
+- A target commit test proves no SQLite write transaction remains open during
+  adapter execution.
 - The published JSON Schema is identified as an alpha read-model subset, not the
   complete behavioral contract.
 - SQLite uses rollback journaling, full synchronization, foreign keys, and a

@@ -12,6 +12,13 @@ from truthlease.models import (
     DependencyCompleteness,
     DependencyKind,
     DependencySnapshot,
+    FenceCoverage,
+    FencedAttempt,
+    FencedAttemptStatus,
+    FencedCommitRequest,
+    FencedOutcome,
+    FencedReceipt,
+    FencedResult,
     GateDecision,
     InvalidationResult,
     Lease,
@@ -21,9 +28,12 @@ from truthlease.models import (
     ReconcileAction,
     ReconciliationItem,
     ReconciliationPlan,
+    ReplayAssurance,
+    TargetPrecondition,
 )
 from truthlease.schema import coherence_schema_text, load_coherence_schema
 from truthlease.storage.sqlite import SQLiteStore
+from truthlease.target import StrictHttpAdapter, TargetAdapter, execute_fenced
 
 __all__ = [
     "Artifact",
@@ -35,6 +45,13 @@ __all__ = [
     "DependencyCompleteness",
     "DependencyKind",
     "DependencySnapshot",
+    "FenceCoverage",
+    "FencedAttempt",
+    "FencedAttemptStatus",
+    "FencedCommitRequest",
+    "FencedOutcome",
+    "FencedReceipt",
+    "FencedResult",
     "GateDecision",
     "InvalidationResult",
     "Lease",
@@ -44,11 +61,16 @@ __all__ = [
     "ReconcileAction",
     "ReconciliationItem",
     "ReconciliationPlan",
+    "ReplayAssurance",
     "SQLiteStore",
+    "StrictHttpAdapter",
+    "TargetAdapter",
+    "TargetPrecondition",
     "TruthLease",
     "TruthLeaseError",
     "coherence_schema_text",
+    "execute_fenced",
     "load_coherence_schema",
 ]
 
-__version__ = "0.1.0a1"
+__version__ = "0.2.0a1"
