@@ -3,6 +3,41 @@
 All notable changes to TruthLease are documented here. The project follows
 [Semantic Versioning](https://semver.org/) once its public contract stabilizes.
 
+## 0.3.0-alpha.1 - 2026-07-22
+
+Stale-safe durable resume vertical slice:
+
+- optional LangGraph `1.2.x` integration with persistent approval, authoritative
+  revalidation, fenced execution, and explicit ambiguous-outcome recovery;
+- digest-minimized checkpoint state containing references, bindings, durable
+  IDs, phases, and stable decision codes instead of raw effects, target tokens,
+  evidence payloads, or exception messages;
+- SQLite schema v3 `lease_requests` binding for restart-safe, idempotent lease
+  acquisition across workflow-node replay;
+- exact lease-intent conflict detection across artifact, effect, target,
+  operation, assurance, microsecond TTL, boot epoch, and target precondition;
+- recovery of the original lease after consumption or invalidation so an
+  existing target attempt is resolved rather than replaced;
+- public read-only lease and lease-to-attempt accessors for framework adapters;
+- real `SqliteSaver` process-restart tests covering policy drift, target-token
+  drift, duplicate dispatch, response loss after commit, incomplete dependency
+  capture, reference drift, strict approval types, and raw-value redaction;
+- explicit recovery approval bound to the current durable attempt status and
+  result digest, including pre-checkpoint crash tests;
+- conservative same-attempt recovery when local persistence fails after a
+  possible target commit, while an already persisted receipt returns without a
+  redundant state read;
+- durable terminal truth taking precedence over stale recovery responses and
+  payload resolvers after an attempt is resolved by another worker;
+- migration tests for populated v1 and v2 stores with no synthetic request
+  backfill;
+- architecture decision record, integration guide, updated threat model, and
+  current competitive boundary.
+
+The alpha does not turn TruthLease into a workflow engine, authorize arbitrary
+LangGraph state, encrypt checkpoints, discover undeclared dependencies, or make
+external effects exactly once without a cooperating deduplicating target.
+
 ## 0.2.0-alpha.1 - 2026-07-20
 
 Target-fencing vertical slice:

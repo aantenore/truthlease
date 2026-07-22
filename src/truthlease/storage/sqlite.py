@@ -39,7 +39,7 @@ from truthlease.models import (
     ReplayAssurance,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 APPLICATION_ID = 0x54525554  # ASCII "TRUT"
 _V1_EXPECTED_TABLES = {
     "artifacts",
@@ -140,13 +140,13 @@ _V1_EXPECTED_INDEXES = {
     "dependencies_reverse_observation",
     "leases_by_artifact",
 }
-_EXPECTED_TABLES = _V1_EXPECTED_TABLES | {
+_V2_EXPECTED_TABLES = _V1_EXPECTED_TABLES | {
     "lease_fence_bindings",
     "fenced_attempts",
     "fenced_results",
     "fenced_receipts",
 }
-_EXPECTED_COLUMNS = {
+_V2_EXPECTED_COLUMNS = {
     **_V1_EXPECTED_COLUMNS,
     "lease_fence_bindings": {
         "lease_id",
@@ -218,11 +218,22 @@ _EXPECTED_COLUMNS = {
         "guarantee_text",
     },
 }
-_EXPECTED_INDEXES = _V1_EXPECTED_INDEXES | {
+_V2_EXPECTED_INDEXES = _V1_EXPECTED_INDEXES | {
     "fenced_attempts_by_status",
     "fenced_results_by_attempt",
     "fenced_receipts_by_lease",
 }
+_EXPECTED_TABLES = _V2_EXPECTED_TABLES | {"lease_requests"}
+_EXPECTED_COLUMNS = {
+    **_V2_EXPECTED_COLUMNS,
+    "lease_requests": {
+        "idempotency_key",
+        "intent_digest",
+        "lease_id",
+        "created_at",
+    },
+}
+_EXPECTED_INDEXES = _V2_EXPECTED_INDEXES
 
 
 class SQLiteStore:
@@ -257,15 +268,18 @@ class SQLiteStore:
                 raise RuntimeError(
                     f"database belongs to application_id {application_id}, not TruthLease"
                 )
-            if version not in (0, 1, SCHEMA_VERSION):
+            if version not in (0, 1, 2, SCHEMA_VERSION):
                 raise RuntimeError(
-                    f"unsupported database schema version {version}; expected 1 or {SCHEMA_VERSION}"
+                    "unsupported database schema version "
+                    f"{version}; expected 1, 2, or {SCHEMA_VERSION}"
                 )
             if version == 0 and (application_id != 0 or existing_tables):
                 raise RuntimeError("refusing to initialize a non-empty unversioned database")
-            if version in (1, SCHEMA_VERSION) and application_id != APPLICATION_ID:
+            if version in (1, 2, SCHEMA_VERSION) and application_id != APPLICATION_ID:
                 raise RuntimeError("versioned database is missing the TruthLease application_id")
-            if version in (1, SCHEMA_VERSION) and not _schema_shape_ok(connection, version=version):
+            if version in (1, 2, SCHEMA_VERSION) and not _schema_shape_ok(
+                connection, version=version
+            ):
                 raise RuntimeError("TruthLease database schema shape is incomplete or unexpected")
             _configure_owned_connection(connection)
             connection.execute("BEGIN IMMEDIATE")
@@ -279,6 +293,10 @@ class SQLiteStore:
                 )
             elif version == 1:
                 _execute_schema(connection, _SCHEMA_V2_ADDITIONS)
+                _execute_schema(connection, _SCHEMA_V3_ADDITIONS)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            elif version == 2:
+                _execute_schema(connection, _SCHEMA_V3_ADDITIONS)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except BaseException:
@@ -690,6 +708,32 @@ class SQLiteUnitOfWork:
             ],
         )
 
+    def get_lease_request(self, idempotency_key: str) -> tuple[str, str] | None:
+        """Return the intent digest and lease bound to one digest-only request key."""
+        row = self.connection.execute(
+            "SELECT intent_digest, lease_id FROM lease_requests WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["intent_digest"]), str(row["lease_id"])
+
+    def insert_lease_request(
+        self,
+        *,
+        idempotency_key: str,
+        intent_digest: str,
+        lease_id: str,
+        created_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO lease_requests(idempotency_key, intent_digest, lease_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (idempotency_key, intent_digest, lease_id, created_at),
+        )
+
     def insert_lease(self, lease: Lease) -> None:
         self.connection.execute(
             """
@@ -1036,6 +1080,10 @@ def _schema_shape_ok(connection: sqlite3.Connection, *, version: int) -> bool:
         expected_tables = _V1_EXPECTED_TABLES
         expected_columns = _V1_EXPECTED_COLUMNS
         expected_indexes = _V1_EXPECTED_INDEXES
+    elif version == 2:
+        expected_tables = _V2_EXPECTED_TABLES
+        expected_columns = _V2_EXPECTED_COLUMNS
+        expected_indexes = _V2_EXPECTED_INDEXES
     elif version == SCHEMA_VERSION:
         expected_tables = _EXPECTED_TABLES
         expected_columns = _EXPECTED_COLUMNS
@@ -1404,7 +1452,19 @@ CREATE INDEX IF NOT EXISTS fenced_receipts_by_lease
 ON fenced_receipts(lease_id);
 """
 
-_SCHEMA = _SCHEMA_V1 + _SCHEMA_V2_ADDITIONS
+
+_SCHEMA_V3_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS lease_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    intent_digest TEXT NOT NULL,
+    lease_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(lease_id) REFERENCES leases(lease_id)
+);
+"""
+
+
+_SCHEMA = _SCHEMA_V1 + _SCHEMA_V2_ADDITIONS + _SCHEMA_V3_ADDITIONS
 
 
 def _execute_schema(connection: sqlite3.Connection, schema: str = _SCHEMA) -> None:

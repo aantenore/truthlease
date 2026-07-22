@@ -1,6 +1,6 @@
 # Competitive landscape
 
-Reviewed on 2026-07-20 using primary project documentation, standards, and
+Reviewed on 2026-07-22 using primary project documentation, standards, and
 original papers.
 
 ## Finding
@@ -11,7 +11,7 @@ transaction runtime.
 
 | Existing system | What it already solves | TruthLease boundary |
 | --- | --- | --- |
-| [Restate](https://docs.restate.dev/ai/patterns/durable-agents), [Temporal](https://docs.temporal.io/activity-definition#idempotency), [LangGraph](https://docs.langchain.com/oss/python/langgraph/persistence) | Durable steps, checkpoints, recovery, and application-level idempotency patterns. | Validate whether the external premises of a saved artifact still match, then bind that lineage to a target commit; the target still owns effect idempotency. |
+| [Restate](https://docs.restate.dev/ai/patterns/durable-agents), [Temporal](https://docs.temporal.io/activity-definition#idempotency), [LangGraph](https://docs.langchain.com/oss/python/langgraph/persistence) | Durable steps, checkpoints, recovery, and application-level idempotency patterns. | Validate whether the external premises of a saved artifact still match, then bind that lineage to a target commit; the target still owns effect idempotency. The optional LangGraph adapter makes this composition executable without absorbing the workflow engine. |
 | [HTTP `If-Match`](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.1), [Google AIP-154](https://google.aip.dev/154), [Kubernetes `resourceVersion`](https://kubernetes.io/docs/reference/kubernetes-api/definitions/object-meta-v1-meta/) | Established optimistic-concurrency tokens and conditional writes. | Bind a target token to the artifact dependency closure, exact effect, stable attempt, coverage, and post-commit receipt rather than inventing a new token. |
 | [`Idempotency-Key` Internet-Draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) | Proposed request-key, fingerprint, replay, and conflict semantics; it is not a final RFC. | Use those semantics as an explicit adapter contract and keep ambiguous outcomes distinct from confirmed commits. |
 | [Drasi](https://drasi.io/concepts/) | Change detection, continuous queries, and reactions across data sources. | Map a source change onto dependent agent artifacts, leases, and reconciliation scope. |
@@ -37,14 +37,18 @@ Build here:
 - local use-time gate and receipts for accepted consumption;
 - immutable target attempts that bind closure, effect, precondition, protected
   scope, and replay contract;
-- core-derived post-commit receipts with explicit coverage and ambiguity.
+- core-derived post-commit receipts with explicit coverage and ambiguity;
+- digest-only lease-request identity for restart-safe recovery;
+- one narrow LangGraph approval-to-effect composition with minimized checkpoint
+  state and same-attempt ambiguous recovery.
 
 Integrate later:
 
 - CloudEvents for transport;
 - W3C PROV for lineage export;
 - MCP, Drasi, or Debezium for source change hints;
-- Restate or Temporal for durable reconciliation work;
+- Restate or Temporal for durable reconciliation work, or other LangGraph graphs
+  beyond the supplied single-effect composition;
 - provider-specific conditional HTTP or datastore compare-and-set adapters;
 - [AgenticStrata](https://github.com/aantenore/AgenticStrata) for wider execution
   contracts and evidence;

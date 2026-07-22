@@ -1,4 +1,4 @@
-# Delivery contract: TruthLease 0.2 alpha
+# Delivery contract: TruthLease 0.3 alpha
 
 ## Objective
 
@@ -6,6 +6,9 @@ Deliver an executable, provider-neutral coherence control plane that prevents an
 application from dispatching an effect through a lease after a known dependency
 of its source artifact changed, and can produce a post-commit receipt when one
 cooperating target atomically enforces the bound state.
+The optional LangGraph composition must also demonstrate that a persisted
+approval resumes through a fresh coherence check and retains one target-attempt
+identity across process restart.
 
 ## Must
 
@@ -36,11 +39,18 @@ cooperating target atomically enforces the bound state.
   distinct and fail closed.
 - Never redispatch an attempt already known as committed or not committed, and
   never let a late transport ambiguity erase a terminal fact.
+- Bind an optional digest-only workflow idempotency key to the complete lease
+  intent and recover the exact original lease after workflow-node replay.
+- Persist only minimized references, digests, IDs, phases, booleans, and stable
+  codes in the supplied LangGraph state contract; keep raw effects, target
+  tokens, evidence payloads, and exception messages behind host callbacks.
+- Revalidate authoritative dependencies after approval and verify effect and
+  precondition references again immediately before target dispatch.
 - Make guarantee and dependency-completeness limits visible.
 - Cap derived and leased completeness at the weakest required transitive
   dependency.
-- Run with no model or hosted service and no third-party Python runtime
-  dependency.
+- Run the deterministic core with no model, hosted service, or third-party
+  Python runtime dependency; keep LangGraph behind an optional extra.
 
 ## Should
 
@@ -49,7 +59,7 @@ cooperating target atomically enforces the bound state.
 - Emit an append-only, deduplicated history of accepted lifecycle events.
 - Ship architecture, protocol, threat-model, and benchmark documentation.
 - Preserve a byte-identical JSON v1 contract and ship a self-contained v2
-  contract plus transactional SQLite v1-to-v2 migration.
+  contract plus transactional SQLite v1/v2-to-v3 migration.
 
 ## Out of scope
 
@@ -80,6 +90,11 @@ cooperating target atomically enforces the bound state.
   same target-side critical section and one effect under ambiguous retry.
 - A target commit test proves no SQLite write transaction remains open during
   adapter execution.
+- Real LangGraph SQLite checkpoints survive close/reopen and cover policy drift,
+  target-token drift, duplicate workflow dispatch, response loss after target
+  commit, incomplete dependency capture, and reference drift.
+- Raw effect and target-token fixtures are absent from both persisted SQLite
+  files after the resume path.
 - The published JSON Schema is identified as an alpha read-model subset, not the
   complete behavioral contract.
 - SQLite uses rollback journaling, full synchronization, foreign keys, and a

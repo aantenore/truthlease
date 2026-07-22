@@ -279,3 +279,8 @@ ineligible for the new path.
 
 The local `gate_receipts` history remains unchanged. Fenced receipts are stored
 separately so a post-commit fact never overwrites a pre-dispatch decision.
+
+TruthLease `0.3` advances the physical SQLite schema to version 3 by adding the
+digest-only `lease_requests` recovery binding. That additive table does not
+change this v2 target-fencing result contract; its workflow-replay semantics are
+defined in [ADR 0003](../adr/0003-langgraph-stale-safe-resume.md).

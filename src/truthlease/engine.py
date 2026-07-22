@@ -402,16 +402,51 @@ class TruthLease:
         required_assurance: AssuranceLevel = AssuranceLevel.OBSERVED,
         ttl: timedelta = timedelta(seconds=30),
         target_precondition: TargetPrecondition | None = None,
+        idempotency_key: str | None = None,
     ) -> Lease:
-        """Bind a short-lived, single-use lease to an exact artifact and effect."""
+        """Bind a short-lived, single-use lease to an exact artifact and effect.
+
+        A digest-only ``idempotency_key`` makes acquisition restart-safe. An
+        identical retry returns the originally issued lease even after it was
+        consumed; reusing the key for different intent is rejected.
+        """
         _require_text("target", target)
         _require_text("operation", operation)
         if ttl <= timedelta(0):
             raise ValueError("lease ttl must be positive")
+        if idempotency_key is not None:
+            _require_digest("idempotency_key", idempotency_key)
         effect_digest = digest_effect(effect, operation=operation, target=target)
+        intent_digest = _lease_request_intent_digest(
+            artifact=artifact,
+            effect_digest=effect_digest,
+            target=target,
+            operation=operation,
+            required_assurance=required_assurance,
+            ttl=ttl,
+            boot_epoch=self.boot_epoch,
+            target_precondition=target_precondition,
+        )
 
         with self.store.transaction(write=True) as tx:
             now = self.clock.now()
+            if idempotency_key is not None:
+                existing_request = tx.get_lease_request(idempotency_key)
+                if existing_request is not None:
+                    existing_intent_digest, existing_lease_id = existing_request
+                    if existing_intent_digest != intent_digest:
+                        raise ConflictError(
+                            "idempotency key is already bound to a different lease intent",
+                            details={
+                                "idempotency_key": idempotency_key,
+                                "existing_intent_digest": existing_intent_digest,
+                                "requested_intent_digest": intent_digest,
+                            },
+                        )
+                    existing_lease = tx.get_lease(existing_lease_id)
+                    if existing_lease is None:
+                        raise RuntimeError("lease request references a missing lease")
+                    return existing_lease
             self._raise_if_faulted(tx)
             current = tx.require_artifact(artifact)
             current = replace(
@@ -535,6 +570,13 @@ class TruthLease:
                     coverage=coverage,
                     replay_assurance=target_precondition.replay_assurance,
                     protected_observations=target_precondition.protected_observations,
+                    created_at=utc_text(now),
+                )
+            if idempotency_key is not None:
+                tx.insert_lease_request(
+                    idempotency_key=idempotency_key,
+                    intent_digest=intent_digest,
+                    lease_id=lease.lease_id,
                     created_at=utc_text(now),
                 )
             event_data: dict[str, Any] = {
@@ -1127,9 +1169,21 @@ class TruthLease:
             raise ConflictError("conflicting terminal target result", details=conflict)
         return derived_receipt
 
+    def get_lease(self, lease_id: str) -> Lease | None:
+        """Return one persisted lease, including terminal state, without mutating it."""
+        _require_text("lease_id", lease_id)
+        with self.store.transaction(write=False) as tx:
+            return tx.get_lease(lease_id)
+
     def get_fenced_attempt(self, attempt_id: str) -> FencedAttempt | None:
         with self.store.transaction(write=False) as tx:
             return tx.get_fenced_attempt(attempt_id)
+
+    def get_fenced_attempt_for_lease(self, lease_id: str) -> FencedAttempt | None:
+        """Return the durable target attempt, if any, for one lease."""
+        _require_text("lease_id", lease_id)
+        with self.store.transaction(write=False) as tx:
+            return tx.get_fenced_attempt_for_lease(lease_id)
 
     def get_fenced_receipt(self, attempt_id: str) -> FencedReceipt | None:
         with self.store.transaction(write=False) as tx:
@@ -1688,6 +1742,44 @@ def _protected_snapshot(
             details={"unknown_observations": unknown},
         )
     return [by_key[key] for key in sorted(target_precondition.protected_observations)]
+
+
+def _lease_request_intent_digest(
+    *,
+    artifact: ArtifactRef,
+    effect_digest: str,
+    target: str,
+    operation: str,
+    required_assurance: AssuranceLevel,
+    ttl: timedelta,
+    boot_epoch: str,
+    target_precondition: TargetPrecondition | None,
+) -> str:
+    """Bind retry identity to caller intent without persisting opaque raw values."""
+    precondition_descriptor_digest = None
+    if target_precondition is not None:
+        descriptor: dict[str, Any] = {
+            "adapter_id": target_precondition.adapter_id,
+            "mechanism": target_precondition.mechanism,
+            "expected_token": target_precondition.expected_token,
+            "protected_observations": sorted(target_precondition.protected_observations),
+            "replay_assurance": target_precondition.replay_assurance.value,
+        }
+        precondition_descriptor_digest = digest_json(
+            descriptor, domain="lease:precondition-descriptor:v1"
+        )
+    ttl_microseconds = ttl.days * 86_400_000_000 + ttl.seconds * 1_000_000 + ttl.microseconds
+    intent: dict[str, Any] = {
+        "artifact": {"id": artifact.artifact_id, "revision": artifact.revision},
+        "effect_digest": effect_digest,
+        "target": target,
+        "operation": operation,
+        "required_assurance": required_assurance.value,
+        "ttl_microseconds": ttl_microseconds,
+        "boot_epoch": boot_epoch,
+        "precondition_descriptor_digest": precondition_descriptor_digest,
+    }
+    return digest_json(intent, domain="lease:request-intent:v1")
 
 
 def digest_effect(effect: Digestable, *, operation: str, target: str) -> str:

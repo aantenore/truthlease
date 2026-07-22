@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "truthlease"
-version = "0.2.0a1"
+version = "0.3.0a1"
 description = "A deterministic coherence control plane that stops agents from using artifacts after their declared dependencies change."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,8 +16,11 @@ keywords = [
   "agents",
   "ai",
   "coherence",
+  "durable-execution",
   "freshness",
+  "idempotency",
   "invalidation",
+  "langgraph",
   "lineage",
 ]
 classifiers = [
@@ -32,10 +35,16 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+langgraph = [
+  "langgraph>=1.2.9,<1.3",
+  "langgraph-checkpoint-sqlite>=3.1,<3.2",
+]
 dev = [
   "check-wheel-contents>=0.6,<0.7",
   "hypothesis>=6.130",
   "jsonschema>=4.23",
+  "langgraph>=1.2.9,<1.3",
+  "langgraph-checkpoint-sqlite>=3.1,<3.2",
   "mypy>=1.15",
   "pytest>=8.3",
   "pytest-cov>=6.0",

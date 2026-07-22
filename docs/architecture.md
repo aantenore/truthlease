@@ -42,6 +42,7 @@ flowchart TB
       Read["Authoritative reads"]
       Replan["Replanner"]
       Fence["Target fence"]
+      Durable["Optional durable orchestrator"]
     end
 
     subgraph Core["TruthLease deterministic core"]
@@ -60,15 +61,17 @@ flowchart TB
     Graph --> Lease --> Gate --> Decision["Local decision / receipt"]
     Decision --> Host["Embedding application"]
     Host --> Fence
+    Durable --> Host
     Host -->|asks for plan| Inv
     Inv -->|returns plan| Host
     Host --> Replan
     Obs & Art & Inv & Lease & Gate --> Events
 ```
 
-The deterministic core, SQLite adapter, and strict HTTP conformance profile are
-implemented in `0.2.0-alpha.1`. Provider integrations remain explicit extension
-boundaries rather than hidden dependencies.
+The deterministic core, SQLite adapter, strict HTTP conformance profile, and an
+optional LangGraph stale-safe resume composition are implemented in
+`0.3.0-alpha.1`. Provider and framework integrations remain explicit extension
+boundaries rather than hidden core dependencies.
 
 ## Domain objects
 
@@ -136,6 +139,14 @@ artifact therefore cannot relabel declared upstream evidence as observed.
 Leases are single-use. `consumed`, `expired`, `invalidated`, and `revoked` are
 terminal states.
 
+An optional digest-only lease request identity sits beside the lease. It binds a
+caller-provided idempotency digest to the complete lease intent: artifact,
+effect, target, operation, assurance, TTL, boot epoch, and target-precondition
+descriptor. An identical retry can therefore recover the original lease after a
+workflow-node restart, including when that lease is already consumed. Reusing
+the key for a different intent fails closed. The binding never stores the raw
+effect, opaque target token, or raw workflow label.
+
 An optional target-precondition binding is stored separately so the closed v1
 lease read model remains unchanged. It binds the adapter and mechanism, a digest
 of the opaque expected token, replay assurance, and a digest of the exact
@@ -184,6 +195,47 @@ protected effect was not applied. A conforming target resolves a known attempt
 and verifies its original request fingerprint before evaluating the current
 ETag, so retry after a lost response cannot turn an earlier commit into `412`.
 A `2xx` without the required evidence remains indeterminate.
+
+## Optional durable-resume composition
+
+TruthLease does not become a workflow engine. The LangGraph integration is an
+adapter above the same public core and target-fencing protocol:
+
+```mermaid
+sequenceDiagram
+    participant U as Human / caller
+    participant G as LangGraph + checkpointer
+    participant L as TruthLease
+    participant S as Authoritative sources
+    participant T as Deduplicating target
+    G-->>U: approval interrupt with refs and digests
+    U->>G: resume(true)
+    G->>S: application callback re-reads sources
+    S->>L: commit changed observations, if any
+    G->>L: acquire fenced lease by intent digest
+    alt artifact still current
+        L-->>G: original or new lease
+        G->>L: prepare same durable attempt
+        G->>T: conditional commit(attempt ID)
+        T-->>G: committed / not committed / indeterminate
+        G->>L: record bound result
+    else stale, incomplete, or conflicting
+        L-->>G: stable fail-closed error code
+    end
+```
+
+LangGraph persists workflow position. TruthLease separately evaluates current
+artifact eligibility and owns the durable lease/attempt identities. The graph
+stores only state version, references, digests, IDs, phase, approval, and stable
+decision codes. Raw effects and preconditions are reconstructed through host
+callbacks and verified twice: after authoritative revalidation and immediately
+before execution.
+
+Ambiguous recovery deliberately skips new authorization and resolves the
+already prepared target attempt. The original immutable references must remain
+available; if they cannot be reconstructed exactly, recovery stops. See
+[the integration guide](langgraph-integration.md) and
+[ADR 0003](adr/0003-langgraph-stale-safe-resume.md).
 
 ## Freshness predicate
 
@@ -270,7 +322,7 @@ enabled.
 ## Dependency direction
 
 ```text
-CLI / target adapter
+CLI / optional orchestrator integration / target adapter
         ↓
 application service (TruthLease)
         ↓

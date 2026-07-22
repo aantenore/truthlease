@@ -17,6 +17,7 @@ from truthlease.models import (
 )
 from truthlease.storage.sqlite import (
     _SCHEMA_V1,
+    _SCHEMA_V2_ADDITIONS,
     APPLICATION_ID,
     SCHEMA_VERSION,
     SQLiteStore,
@@ -39,6 +40,7 @@ _V2_TABLES = (
     "fenced_results",
     "fenced_receipts",
 )
+_V3_TABLES = ("lease_requests",)
 
 
 def _create_populated_v1(path: Path) -> None:
@@ -177,6 +179,37 @@ def _create_populated_v1(path: Path) -> None:
         connection.close()
 
 
+def _create_populated_v2(path: Path) -> None:
+    _create_populated_v1(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        _execute_schema(connection, _SCHEMA_V2_ADDITIONS)
+        connection.execute("PRAGMA user_version = 2")
+        connection.execute(
+            """
+            INSERT INTO lease_fence_bindings(
+                lease_id, adapter_id, mechanism, precondition_digest, scope_digest,
+                coverage, replay_assurance, protected_observations_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-fenced-lease",
+                "adapter:test",
+                "compare-and-swap",
+                "sha256:precondition",
+                "sha256:scope",
+                "full",
+                "deduplicated",
+                json.dumps(["policy"]),
+                "2026-07-20T11:59:30.000000Z",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _counts(path: Path, tables: tuple[str, ...]) -> dict[str, int]:
     connection = sqlite3.connect(path)
     try:
@@ -188,7 +221,7 @@ def _counts(path: Path, tables: tuple[str, ...]) -> dict[str, int]:
         connection.close()
 
 
-def test_v1_to_v2_migration_preserves_rows_without_false_fence_backfill(
+def test_v1_to_v3_migration_preserves_rows_without_false_backfill(
     db_path: Path, clock: ManualClock
 ) -> None:
     _create_populated_v1(db_path)
@@ -198,9 +231,10 @@ def test_v1_to_v2_migration_preserves_rows_without_false_fence_backfill(
     store.initialize()
 
     assert store.integrity_check()["ok"] is True
-    assert store.integrity_check()["schema_version"] == SCHEMA_VERSION == 2
+    assert store.integrity_check()["schema_version"] == SCHEMA_VERSION == 3
     assert _counts(db_path, _V1_TABLES) == before
     assert _counts(db_path, _V2_TABLES) == {table: 0 for table in _V2_TABLES}
+    assert _counts(db_path, _V3_TABLES) == {table: 0 for table in _V3_TABLES}
 
     runtime = TruthLease(
         store,
@@ -239,7 +273,22 @@ def test_v1_to_v2_migration_preserves_rows_without_false_fence_backfill(
         )
 
 
-def test_malformed_v1_shape_is_rejected_before_any_v2_mutation(db_path: Path) -> None:
+def test_v2_to_v3_migration_preserves_rows_without_false_request_backfill(
+    db_path: Path,
+) -> None:
+    _create_populated_v2(db_path)
+    before = _counts(db_path, _V1_TABLES + _V2_TABLES)
+
+    store = SQLiteStore(db_path)
+    store.initialize()
+
+    assert store.integrity_check()["ok"] is True
+    assert store.integrity_check()["schema_version"] == SCHEMA_VERSION == 3
+    assert _counts(db_path, _V1_TABLES + _V2_TABLES) == before
+    assert _counts(db_path, _V3_TABLES) == {"lease_requests": 0}
+
+
+def test_malformed_v1_shape_is_rejected_before_any_migration(db_path: Path) -> None:
     _create_populated_v1(db_path)
     connection = sqlite3.connect(db_path)
     try:
@@ -263,3 +312,29 @@ def test_malformed_v1_shape_is_rejected_before_any_v2_mutation(db_path: Path) ->
     finally:
         connection.close()
     assert not (tables & set(_V2_TABLES))
+
+
+def test_malformed_v2_shape_is_rejected_before_any_v3_mutation(db_path: Path) -> None:
+    _create_populated_v2(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX fenced_receipts_by_lease")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="schema shape"):
+        SQLiteStore(db_path).initialize()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == 2
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+    finally:
+        connection.close()
+    assert not (tables & set(_V3_TABLES))

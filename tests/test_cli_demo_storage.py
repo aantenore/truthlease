@@ -8,7 +8,7 @@ import pytest
 
 from truthlease.cli import main
 from truthlease.demo import run_demo
-from truthlease.storage.sqlite import SQLiteStore
+from truthlease.storage.sqlite import SCHEMA_VERSION, SQLiteStore
 
 
 def test_demo_proves_partial_reuse_and_store_integrity(tmp_path: Path) -> None:
@@ -114,7 +114,7 @@ def test_database_integrity_contract(tmp_path: Path) -> None:
     assert report["ok"] is True
     assert report["foreign_keys_enabled"] is True
     assert report["journal_mode"] == "delete"
-    assert report["schema_version"] == 2
+    assert report["schema_version"] == SCHEMA_VERSION == 3
 
 
 def test_cli_exposes_and_enforces_observation_generation(

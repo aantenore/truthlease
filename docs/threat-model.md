@@ -2,7 +2,7 @@
 
 ## Scope and trust assumptions
 
-The `0.2` alpha assumes:
+The `0.3` alpha assumes:
 
 - the host, operating system, Python process, and SQLite file owner are trusted;
 - one application or physically separate database owns each trust domain;
@@ -11,7 +11,9 @@ The `0.2` alpha assumes:
 - external sources are authoritative only when registered by the embedding
   application;
 - a target that claims conditional commit and deduplication implements both
-  atomically for the scope declared by its adapter.
+  atomically for the scope declared by its adapter;
+- durable-orchestrator checkpoints, effect/precondition reference stores, and
+  the callbacks that resolve them are inside the trusted host boundary.
 
 TruthLease does not claim secure multi-tenancy inside one SQLite database.
 
@@ -22,6 +24,7 @@ TruthLease does not claim secure multi-tenancy inside one SQLite database.
 - active lease secrecy and single-use state;
 - gate receipt and accepted-lifecycle event history integrity;
 - immutable attempt, precondition, scope, request, and target-result bindings;
+- lease-request identity and immutable workflow-reference bindings;
 - distinction between confirmed, rejected, and indeterminate remote outcomes;
 - availability of the invalidation and gate path.
 
@@ -37,6 +40,12 @@ TruthLease does not claim secure multi-tenancy inside one SQLite database.
 | Source changes after local gate | Explicit assurance label and residual-race text. | Only target-side fencing closes this race. |
 | Target changes after local prepare | A trusted adapter must atomically enforce the bound precondition; the HTTP profile uses strong `If-Match`. | The adapter assertion cannot prove a dishonest or incorrectly implemented target. |
 | Duplicate effect after a lost response | The attempt ID is stable and the target contract declares deduplicated replay; recovery reuses the same request fingerprint. | If target retention expires before resolution, the outcome remains indeterminate and automatic retry stops. |
+| Duplicate workflow-node execution | A digest-only idempotency key atomically binds the full lease intent and recovers the original lease, including its consumed attempt. Ambiguous recovery approval is bound to the attempt status and result digest. | Different workflow keys can intentionally create different leases; an approved resolution may repeat transport after a crash and therefore still requires target deduplication. |
+| Stale durable checkpoint | Resume performs an authoritative re-read, verifies immutable effect and precondition references, and acquires a current fenced lease before first dispatch. | An undeclared dependency or dishonest authoritative source remains outside the guarantee. |
+| Reference changes between authorization and execution | The execute node resolves and verifies the effect and precondition a second time before target dispatch. | A compromised resolver or host can substitute both data and control flow. |
+| Raw payload leakage through checkpoint state | The supplied state contract stores references, digests, IDs, booleans, phases, and stable codes; tests scan both SQLite stores for raw effect and target-token fixtures. | References, LangGraph thread IDs, host logs, and custom callback telemetry can still leak data if the application puts secrets in them. |
+| Tampered or guessed checkpoint digest | Core intent binding detects inconsistent reuse, and changed references fail closed. | Digests are not signatures or encryption; the trusted-host assumption remains, and low-entropy identifiers need a keyed digest for confidentiality. |
+| Exception text persisted by integration | Callback failures are reduced to stage-specific stable codes before being returned as graph state. | Failures outside the caught node boundary or application logging can still expose exception details. |
 | False global fencing from a narrow token | The scope digest names the exact protected observation snapshots; only full closure coverage can derive `fenced`. | The embedding application must describe which facts the target token actually protects. |
 | Forged success response | The result must bind the attempt, request, closure, effect, precondition, scope, adapter, target, and operation. | A compromised trusted adapter or host can still fabricate evidence. |
 | Conflicting result replay | Indeterminate evidence may resolve under the same attempt. A late transport ambiguity cannot erase a known terminal fact, while different terminal evidence marks the attempt disputed, invalidates its historical receipt, and fails closed. | Operators must investigate the target and adapter before recovery. |
@@ -93,6 +102,15 @@ receipt. `observed` and `revalidated` never claim that guarantee.
   authoritative verification.
 - Reuse the original attempt and request fingerprint when resolving an ambiguous
   target call; never mint a fresh key merely because the caller timed out.
+- Derive one stable, digest-only workflow key per logical effect and use it for
+  both TruthLease idempotency and the LangGraph `thread_id`; do not place a raw
+  user, prompt, credential, or business identifier in either field.
+- Keep effect and precondition references immutable and resolvable for at least
+  the full checkpoint and target-deduplication recovery horizon.
+- Treat LangGraph state version and node names as a persistence contract. Migrate
+  paused checkpoints before renaming either.
+- For production checkpointers, configure access control, encryption, retention,
+  concurrency, and backups independently of TruthLease.
 - Keep target deduplication retention longer than the maximum retry and recovery
   horizon. When retention is unknown or expired, stop automatically.
 - Treat partial scope as partial even when the target commit succeeds. Separate

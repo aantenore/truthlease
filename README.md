@@ -23,6 +23,10 @@ effect.**
 - **Why it matters:** durable execution can resume an interrupted workflow, but
   resuming reliably is different from checking that the saved decision is still
   valid.
+- **What the LangGraph integration adds:** a paused effect can survive a process
+  restart, re-read its authoritative dependencies, and either reuse one durable
+  lease and target attempt or stop with a stable reconciliation code. The
+  checkpoint stores references and digests, not the raw effect or target token.
 - **Concrete example:** a release plan uses policy `v12` and test report `r7`.
   Policy `v13` arrives while the workflow is paused. TruthLease blocks the old
   plan, preserves test report `r7`, and identifies only the work that now needs
@@ -45,6 +49,7 @@ about what is reusable, stale, or still uncertain.
 | Short-lived, single-use leases | A stale or substituted effect is rejected at the local gate. |
 | Bound target preconditions and stable attempt IDs | A cooperating endpoint can reject stale state and deduplicate an ambiguous retry. |
 | Post-commit fenced receipts | Operators can distinguish a local permit from a target-confirmed effect. |
+| Optional LangGraph stale-safe resume | A persisted approval resumes only after authoritative revalidation; crash recovery reuses the same lease and target attempt. |
 | Explicit assurance and completeness | Operators can see what the runtime actually knows instead of trusting a vague safety claim. |
 | Lifecycle events and SQLite integrity checks | Accepted lifecycle changes are inspectable and the local store fails closed. Denials are returned decisions, not guaranteed journal entries. |
 
@@ -57,13 +62,19 @@ about what is reusable, stale, or still uncertain.
 ## Quick start
 
 TruthLease requires Python 3.11 or newer and has no third-party runtime
-dependencies.
+dependencies in its core. The LangGraph adapter is an optional extra.
 
 ```bash
 git clone https://github.com/aantenore/truthlease.git
 cd truthlease
 uv sync --extra dev
 uv run truthlease demo --reset
+```
+
+For persistent LangGraph approval and resume:
+
+```bash
+uv sync --extra langgraph
 ```
 
 The demo constructs this graph:
@@ -84,6 +95,75 @@ It then proves that:
 - `test-report@1` remains fresh and reusable;
 - an identical change event is idempotent;
 - a new plan revision can acquire and consume a new lease.
+
+## LangGraph: resume the workflow, re-check the decision
+
+LangGraph checkpoints preserve workflow position; TruthLease separately checks
+whether the saved action is still eligible at the durable-effect boundary. The
+integration composes the two without making LangGraph a core dependency:
+
+```mermaid
+flowchart LR
+    Pause["Approval interrupt"] --> Checkpoint["LangGraph checkpoint"]
+    Checkpoint --> Resume["Process restart + resume"]
+    Resume --> Revalidate["Authoritative re-read"]
+    Revalidate -->|changed| Stop["Reconcile; no target effect"]
+    Revalidate -->|still current| Lease["Idempotent fenced lease"]
+    Lease --> Target["One durable target attempt"]
+    Target -->|response lost| Recover["Recovery interrupt"]
+    Recover --> Target
+    Target --> Receipt["Fenced receipt"]
+```
+
+The public surface is deliberately callback-driven: source revalidation, effect
+resolution, target-precondition resolution, evidence production, target adapter,
+and checkpointer are all replaceable.
+
+```python
+import sqlite3
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
+from truthlease.integrations.langgraph import (
+    build_stale_safe_graph,
+    make_resume_state,
+    workflow_idempotency_key,
+)
+
+# `runtime`, `plan`, `effect`, `precondition`, `endpoint`, `adapter`, and the
+# callback functions below are application-owned objects.
+workflow_key = workflow_idempotency_key({"workflow": "release-2026.07"})
+state = make_resume_state(
+    idempotency_key=workflow_key,
+    artifact=plan.ref,
+    effect_ref="effects/release-2026.07",
+    effect=effect,
+    precondition_ref="preconditions/deployment/revision-7",
+    target_precondition=precondition,
+    target=endpoint,
+    operation="promote",
+)
+checkpointer = SqliteSaver(sqlite3.connect("workflow.db", check_same_thread=False))
+graph = build_stale_safe_graph(
+    runtime,
+    checkpointer=checkpointer,
+    revalidate=revalidate_sources,
+    resolve_effect=resolve_effect,
+    resolve_precondition=resolve_precondition,
+    evidence_provider=provide_evidence,
+    target_adapter=adapter,
+)
+config = {"configurable": {"thread_id": workflow_key}}
+paused = graph.invoke(state, config=config)
+resumed = graph.invoke(Command(resume=True), config=config)
+```
+
+The snippet shows the composition contract; the callbacks and fenced target must
+be supplied by the host application. Use immutable, versioned references and
+return the exact original effect and precondition during ambiguous-attempt
+recovery. Node names and checkpoint fields are versioned persistence contracts.
+See the complete [LangGraph integration guide](docs/langgraph-integration.md) and
+[ADR 0003](docs/adr/0003-langgraph-stale-safe-resume.md).
 
 ## Python API
 
@@ -297,6 +377,7 @@ the invalidation closure.
 
 Read the
 [architecture](https://github.com/aantenore/truthlease/blob/main/docs/architecture.md),
+[LangGraph stale-safe resume guide](https://github.com/aantenore/truthlease/blob/main/docs/langgraph-integration.md),
 [target-fencing contract](https://github.com/aantenore/truthlease/blob/main/docs/spec/coherence-v2.md),
 [base coherence contract](https://github.com/aantenore/truthlease/blob/main/docs/spec/coherence-v1.md),
 [threat model](https://github.com/aantenore/truthlease/blob/main/docs/threat-model.md), and
@@ -322,10 +403,12 @@ These public projects are complementary rather than one growing framework:
 - distributed transactions, universal rollback, or exactly-once external effects;
 - an authentication, authorization, or policy engine.
 
-Use Restate, Temporal, or LangGraph for durable execution; Drasi or Debezium for
-high-volume change capture; a policy engine for authorization; and target-side
-idempotency plus fencing for durable effects. TruthLease connects their version
-evidence to the artifacts that an agent may later use.
+Use Restate, Temporal, or LangGraph for general durable execution; Drasi or
+Debezium for high-volume change capture; a policy engine for authorization; and
+target-side idempotency plus fencing for durable effects. TruthLease connects
+their version evidence to the artifacts that an agent may later use. Its
+LangGraph adapter is a narrow executable composition for one approval-to-effect
+boundary, not a replacement workflow engine.
 
 ## Why a separate project
 
@@ -362,7 +445,7 @@ uv run ruff check .
 uv run mypy
 uv run pytest --cov=truthlease --cov-report=term-missing
 uv run python benchmarks/benchmark_fence_correctness.py
-uv build
+uv build --no-sources
 ```
 
 This is an executable alpha. See
